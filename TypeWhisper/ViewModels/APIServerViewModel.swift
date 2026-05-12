@@ -20,6 +20,12 @@ final class APIServerViewModel: ObservableObject {
     @Published var port: UInt16 {
         didSet { UserDefaults.standard.set(Int(port), forKey: UserDefaultsKeys.apiServerPort) }
     }
+    @Published var requiresAuthentication: Bool {
+        didSet {
+            UserDefaults.standard.set(requiresAuthentication, forKey: UserDefaultsKeys.apiServerRequiresAuthentication)
+            apiAuthenticator.setRequiresAuthentication(requiresAuthentication)
+        }
+    }
     @Published var errorMessage: String?
 
     private let httpServer: HTTPServer
@@ -31,6 +37,8 @@ final class APIServerViewModel: ObservableObject {
         self.isEnabled = UserDefaults.standard.bool(forKey: UserDefaultsKeys.apiServerEnabled)
         let savedPort = UserDefaults.standard.integer(forKey: UserDefaultsKeys.apiServerPort)
         self.port = savedPort > 0 ? UInt16(savedPort) : 8978
+        self.requiresAuthentication = UserDefaults.standard.bool(forKey: UserDefaultsKeys.apiServerRequiresAuthentication)
+        apiAuthenticator.setRequiresAuthentication(requiresAuthentication)
 
         httpServer.onStateChange = { [weak self] running in
             DispatchQueue.main.async {
@@ -117,16 +125,34 @@ final class LocalAPIAuthenticator: @unchecked Sendable {
     private static let keychainService = "local-api-token"
     private static let tokenByteCount = 32
 
-    private let token = OSAllocatedUnfairLock<String?>(initialState: nil)
+    private let token: OSAllocatedUnfairLock<String?>
+    private let requiresAuthentication: OSAllocatedUnfairLock<Bool>
 
-    init() {
-        if let existingToken = KeychainService.load(service: Self.keychainService), !existingToken.isEmpty {
+    init(
+        initialToken: String? = nil,
+        requiresAuthentication: Bool = UserDefaults.standard.bool(forKey: UserDefaultsKeys.apiServerRequiresAuthentication)
+    ) {
+        token = OSAllocatedUnfairLock<String?>(initialState: initialToken)
+        self.requiresAuthentication = OSAllocatedUnfairLock<Bool>(initialState: requiresAuthentication)
+
+        if initialToken == nil,
+           let existingToken = KeychainService.load(service: Self.keychainService),
+           !existingToken.isEmpty {
             token.withLock { $0 = existingToken }
         }
     }
 
     func currentToken() -> String? {
         token.withLock { $0 }
+    }
+
+    func tokenForEnforcedRequests() -> String? {
+        guard requiresAuthentication.withLock({ $0 }) else { return nil }
+        return currentToken()
+    }
+
+    func setRequiresAuthentication(_ enabled: Bool) {
+        requiresAuthentication.withLock { $0 = enabled }
     }
 
     func loadOrCreateToken() throws -> String {

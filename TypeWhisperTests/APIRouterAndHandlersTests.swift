@@ -750,6 +750,18 @@ final class APIRouterAndHandlersTests: XCTestCase {
         XCTAssertEqual(goodHeaderToken.status, 200)
     }
 
+    func testLocalAPIAuthenticatorEnforcesTokenOnlyWhenEnabled() {
+        let authenticator = LocalAPIAuthenticator(initialToken: "test-token", requiresAuthentication: false)
+
+        XCTAssertNil(authenticator.tokenForEnforcedRequests())
+
+        authenticator.setRequiresAuthentication(true)
+        XCTAssertEqual(authenticator.tokenForEnforcedRequests(), "test-token")
+
+        authenticator.setRequiresAuthentication(false)
+        XCTAssertNil(authenticator.tokenForEnforcedRequests())
+    }
+
     func testSerializedResponseOmitsWildcardCORSHeaders() {
         let responseText = String(decoding: HTTPResponse.json(["ok": true]).serialized(), as: UTF8.self)
 
