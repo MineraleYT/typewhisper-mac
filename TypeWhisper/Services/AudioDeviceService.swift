@@ -2089,12 +2089,16 @@ final class CoreAudioHALInputCaptureSession: AudioInputCaptureSession, @unchecke
               let format = AVAudioFormat(
                   commonFormat: .pcmFormatFloat32,
                   sampleRate: hardwareFormat.sampleRate,
-                  channels: hardwareFormat.channelCount,
+                  channels: inputOnlyCaptureChannelCount(for: hardwareFormat.channelCount),
                   interleaved: false
               ) else {
             throw SelectedInputDeviceError.incompatible(.invalidInputFormat)
         }
         return format
+    }
+
+    private static func inputOnlyCaptureChannelCount(for hardwareChannelCount: AVAudioChannelCount) -> AVAudioChannelCount {
+        min(hardwareChannelCount, 2)
     }
 
     func stop() {
@@ -2636,6 +2640,12 @@ extension AudioDeviceService {
 
     func testingShouldSuppressBluetoothPreviewConfigurationChange(now: TimeInterval) -> Bool {
         shouldSuppressBluetoothPreviewConfigurationChange(now: now)
+    }
+}
+
+extension CoreAudioHALInputCaptureSession {
+    static func testingInputOnlyCaptureChannelCount(for hardwareChannelCount: AVAudioChannelCount) -> AVAudioChannelCount {
+        inputOnlyCaptureChannelCount(for: hardwareChannelCount)
     }
 }
 #endif
