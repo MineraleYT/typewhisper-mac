@@ -1230,6 +1230,12 @@ final class AudioRecordingServiceSelectedDeviceTests: XCTestCase {
 }
 
 final class CoreAudioHALInputCaptureSessionTests: XCTestCase {
+    func testInputOnlyCaptureCapsMultichannelHardwareToStereoClientFormat() {
+        XCTAssertEqual(CoreAudioHALInputCaptureSession.testingInputOnlyCaptureChannelCount(for: 1), 1)
+        XCTAssertEqual(CoreAudioHALInputCaptureSession.testingInputOnlyCaptureChannelCount(for: 2), 2)
+        XCTAssertEqual(CoreAudioHALInputCaptureSession.testingInputOnlyCaptureChannelCount(for: 14), 2)
+    }
+
     func testSessionConfiguresInputOnlyHALUnitAndPullsInputFromRenderCallback() throws {
         let operations = FakeCoreAudioHALInputOperations()
         let format = try XCTUnwrap(AVAudioFormat(
