@@ -279,7 +279,11 @@ final class MenuBarGroupingTests: XCTestCase {
             [.toggleRecorder]
         )
         XCTAssertEqual(
-            MenuBarMenuSection.transcription.items,
+            MenuBarMenuSection.transcription.items(hasRecoverableRecording: true),
+            [.transcribeFile, .recoverLastRecording, .recentTranscriptions, .copyLastTranscription, .readBackLastTranscription]
+        )
+        XCTAssertEqual(
+            MenuBarMenuSection.transcription.items(hasRecoverableRecording: false),
             [.transcribeFile, .recentTranscriptions, .copyLastTranscription, .readBackLastTranscription]
         )
         XCTAssertEqual(

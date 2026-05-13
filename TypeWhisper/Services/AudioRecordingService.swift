@@ -88,6 +88,8 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
     /// tears down the session, and resumes any paused media / restores ducking.
     /// Reset to nil at the start of each `startRecording`.
     @Published private(set) var recoveryError: AudioRecordingError?
+    @Published private(set) var recoverableRecordingURLs: [URL]
+    @Published private(set) var recoverableRecordingURL: URL?
     var hasMicrophonePermissionOverride: Bool?
     var inputAvailabilityOverride: ((AudioDeviceID?) -> Bool)?
     var startRecordingOverride: (() throws -> Void)?
@@ -140,6 +142,7 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
     private let recoveryQueue = DispatchQueue(label: "com.typewhisper.audio-recovery", qos: .userInitiated)
     private let engineTeardownRetainer = DelayedReleaseRetainer<AVAudioEngine>(label: "com.typewhisper.audio-engine-teardown")
     private let recoveryCoordinator = AudioEngineRecoveryCoordinator()
+    private let recoveryAudioStore: DictationRecoveryAudioStore
     private let outputVolumeGuard: AudioOutputVolumeGuard
     private let inputActivationGuard: AudioInputDeviceActivating
     private let bluetoothInputRouteStabilizer: BluetoothInputRouteStabilizing
@@ -159,13 +162,18 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
         inputActivationGuard: AudioInputDeviceActivating = AudioInputDeviceActivationGuard(),
         bluetoothInputRouteStabilizer: BluetoothInputRouteStabilizing = CoreAudioBluetoothInputRouteStabilizer(),
         inputReadinessChecker: AudioInputReadinessChecking = BluetoothInputReadinessChecker(),
-        inputCaptureFactory: AudioInputCaptureFactory = CoreAudioHALInputCaptureFactory()
+        inputCaptureFactory: AudioInputCaptureFactory = CoreAudioHALInputCaptureFactory(),
+        recoveryAudioStore: DictationRecoveryAudioStore = DictationRecoveryAudioStore()
     ) {
         self.outputVolumeGuard = outputVolumeGuard
         self.inputActivationGuard = inputActivationGuard
         self.bluetoothInputRouteStabilizer = bluetoothInputRouteStabilizer
         self.inputReadinessChecker = inputReadinessChecker
         self.inputCaptureFactory = inputCaptureFactory
+        self.recoveryAudioStore = recoveryAudioStore
+        let recoveryURLs = recoveryAudioStore.recoveryURLs
+        self.recoverableRecordingURLs = recoveryURLs
+        self.recoverableRecordingURL = recoveryURLs.first
         recoveryNotificationQueue.underlyingQueue = recoveryQueue
     }
 
@@ -269,6 +277,8 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
 
         try validateRecordingInputAvailability()
         clearRecordingBuffer(requestUptimeNanoseconds: requestUptimeNanoseconds)
+        recoveryAudioStore.startNewRecording()
+        publishRecoverableRecordingURLs(recoveryAudioStore.recoveryURLs)
 
         let routeActivationRequest = selectedRouteActivationRequest
         outputVolumeGuard.captureBaseline()
@@ -280,6 +290,7 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
         ) else {
             outputVolumeGuard.restoreIfRaised(reason: "recording-start-input-activation-failed")
             outputVolumeGuard.clear()
+            discardActiveRecoveryRecording(keepingLatest: true)
             throw AudioRecordingError.audioRoutingConflict
         }
 
@@ -293,6 +304,7 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
             outputVolumeGuard.restoreIfRaised(reason: "recording-start-route-stabilization-failed")
             outputVolumeGuard.clear()
             inputActivationGuard.restore(reason: "recording-start-route-stabilization-failed")
+            discardActiveRecoveryRecording(keepingLatest: true)
             throw error
         }
 
@@ -310,6 +322,7 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
                 outputVolumeGuard.restoreIfRaised(reason: "recording-start-override-failed")
                 outputVolumeGuard.clear()
                 inputActivationGuard.restore(reason: "recording-start-override-failed")
+                discardActiveRecoveryRecording(keepingLatest: true)
                 throw error
             }
             return
@@ -323,6 +336,7 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
                 isRecording = true
             } catch {
                 cleanupAfterFailedInputOnlyStart()
+                discardActiveRecoveryRecording(keepingLatest: true)
                 throw error
             }
             return
@@ -359,6 +373,7 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
         } catch {
             let failedEngine = engineLock.withLock { audioEngine } ?? engine
             cleanupAfterFailedStart(failedEngine)
+            discardActiveRecoveryRecording(keepingLatest: true)
             throw error
         }
     }
@@ -551,6 +566,9 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
         outputVolumeGuard.restoreIfRaised(reason: "recording-recovery-failure")
         outputVolumeGuard.clear()
         inputActivationGuard.restore(reason: "recording-recovery-failure")
+        processingQueue.sync { }
+        let recoveryURL = preserveActiveRecoveryRecording()
+        let recoveryURLs = recoveryRecordingURLs
         clearRecordingBuffer()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -558,6 +576,8 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
             self.isRecording = false
             self.audioLevel = 0
             self.rawAudioLevel = 0
+            self.recoverableRecordingURLs = recoveryURLs
+            self.recoverableRecordingURL = recoveryURL
         }
     }
 
@@ -996,6 +1016,7 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
             )
         }
         bufferLock.unlock()
+        recoveryAudioStore.append(samples)
 
         if let requestToFirstBufferMs {
             logger.info(
@@ -1049,6 +1070,53 @@ final class AudioRecordingService: ObservableObject, @unchecked Sendable {
     /// unwound so the @Published value doesn't linger for later bindings.
     func clearRecoveryError() {
         recoveryError = nil
+    }
+
+    var latestRecoveryRecordingURL: URL? {
+        recoveryAudioStore.latestRecoveryURL
+    }
+
+    var recoveryRecordingURLs: [URL] {
+        recoveryAudioStore.recoveryURLs
+    }
+
+    @discardableResult
+    func preserveActiveRecoveryRecording() -> URL? {
+        let url = recoveryAudioStore.preserveActiveRecording()
+        publishRecoverableRecordingURLs(recoveryAudioStore.recoveryURLs)
+        return url
+    }
+
+    func discardActiveRecoveryRecording() {
+        discardActiveRecoveryRecording(keepingLatest: true)
+    }
+
+    func discardRecoveryRecording(at url: URL) {
+        recoveryAudioStore.discardRecovery(at: url)
+        publishRecoverableRecordingURLs(recoveryAudioStore.recoveryURLs)
+    }
+
+    func discardAllRecoveryRecordings() {
+        recoveryAudioStore.discardAllRecoveries()
+        publishRecoverableRecordingURLs([])
+    }
+
+    private func discardActiveRecoveryRecording(keepingLatest: Bool) {
+        recoveryAudioStore.discardActiveRecording(keepingLatest: keepingLatest)
+        publishRecoverableRecordingURLs(recoveryAudioStore.recoveryURLs)
+    }
+
+    private func publishRecoverableRecordingURLs(_ urls: [URL]) {
+        let latestURL = urls.first
+        if Thread.isMainThread {
+            recoverableRecordingURLs = urls
+            recoverableRecordingURL = latestURL
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.recoverableRecordingURLs = urls
+                self?.recoverableRecordingURL = latestURL
+            }
+        }
     }
 
     private func mapSelectedInputDeviceError(_ error: SelectedInputDeviceError) -> AudioRecordingError {
@@ -1213,6 +1281,14 @@ extension AudioRecordingService {
 
     func testingMarkInitialInputTapSeen(_ buffer: AVAudioPCMBuffer) {
         markInitialInputTapSeenIfNeeded(buffer)
+    }
+
+    func testingProcessConvertedSamples(_ samples: [Float]) {
+        processConvertedSamples(samples)
+    }
+
+    func testingFailActiveRecordingDueToRecovery(_ error: AudioRecordingError) {
+        failActiveRecordingDueToRecovery(error)
     }
 }
 #endif
