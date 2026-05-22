@@ -59,7 +59,7 @@ final class AudioRecorderViewModel: ObservableObject {
         let languageSelection: LanguageSelection
         let task: TranscriptionTask
         let providerId: String?
-        let modelId: String?
+        let resolvedModelId: String?
         let prompt: String?
         let liveSessionResult: TranscriptionResult?
     }
@@ -79,28 +79,39 @@ final class AudioRecorderViewModel: ObservableObject {
     @Published var micLevel: Float = 0
     @Published var systemLevel: Float = 0
     @Published var micEnabled: Bool {
-        didSet { UserDefaults.standard.set(micEnabled, forKey: UserDefaultsKeys.recorderMicEnabled) }
+        didSet { defaults.set(micEnabled, forKey: UserDefaultsKeys.recorderMicEnabled) }
     }
     @Published var systemAudioEnabled: Bool {
-        didSet { UserDefaults.standard.set(systemAudioEnabled, forKey: UserDefaultsKeys.recorderSystemAudioEnabled) }
+        didSet { defaults.set(systemAudioEnabled, forKey: UserDefaultsKeys.recorderSystemAudioEnabled) }
     }
     @Published var outputFormat: AudioRecorderService.OutputFormat {
-        didSet { UserDefaults.standard.set(outputFormat.rawValue, forKey: UserDefaultsKeys.recorderOutputFormat) }
+        didSet { defaults.set(outputFormat.rawValue, forKey: UserDefaultsKeys.recorderOutputFormat) }
     }
     @Published var micDuckingMode: AudioRecorderService.MicDuckingMode {
         didSet {
-            UserDefaults.standard.set(micDuckingMode.rawValue, forKey: UserDefaultsKeys.recorderMicDuckingMode)
+            defaults.set(micDuckingMode.rawValue, forKey: UserDefaultsKeys.recorderMicDuckingMode)
             recorderService.micDuckingMode = micDuckingMode
         }
     }
     @Published var trackMode: AudioRecorderService.TrackMode {
         didSet {
-            UserDefaults.standard.set(trackMode.rawValue, forKey: UserDefaultsKeys.recorderTrackMode)
+            defaults.set(trackMode.rawValue, forKey: UserDefaultsKeys.recorderTrackMode)
             recorderService.trackMode = trackMode
         }
     }
     @Published var transcriptionEnabled: Bool {
-        didSet { UserDefaults.standard.set(transcriptionEnabled, forKey: UserDefaultsKeys.recorderTranscriptionEnabled) }
+        didSet { defaults.set(transcriptionEnabled, forKey: UserDefaultsKeys.recorderTranscriptionEnabled) }
+    }
+    @Published var selectedEngine: String? {
+        didSet {
+            defaults.set(selectedEngine, forKey: UserDefaultsKeys.recorderTranscriptionEngine)
+            guard isInitialized, oldValue != selectedEngine else { return }
+            selectedModel = nil
+            normalizeLanguageSelectionForResolvedEngine()
+        }
+    }
+    @Published var selectedModel: String? {
+        didSet { defaults.set(selectedModel, forKey: UserDefaultsKeys.recorderTranscriptionModel) }
     }
     @Published var languageSelection: LanguageSelection = .auto
     @Published var selectedTask: TranscriptionTask = .transcribe
@@ -110,10 +121,36 @@ final class AudioRecorderViewModel: ObservableObject {
     @Published var partialText: String = ""
     @Published var isTranscribing: Bool = false
 
-    var activeEngineName: String? { modelManager.activeEngineName }
-    var activeModelName: String? { modelManager.activeModelName }
-    var isModelReady: Bool { modelManager.isModelReady }
-    var supportsTranslation: Bool { modelManager.supportsTranslation }
+    var activeEngineName: String? { resolvedEngine?.providerDisplayName }
+    var activeModelName: String? {
+        modelManager.resolvedModelDisplayName(
+            engineOverrideId: selectedEngine,
+            cloudModelOverride: effectiveModelId
+        )
+    }
+    var isModelReady: Bool {
+        guard let engine = resolvedEngine else { return false }
+        guard modelManager.canUseForTranscription(engine) else { return false }
+        return engine.isConfigured
+    }
+    var supportsTranslation: Bool { resolvedEngine?.supportsTranslation ?? false }
+    var effectiveProviderId: String? {
+        selectedEngine ?? modelManager.selectedProviderId
+    }
+    var effectiveModelId: String? {
+        modelManager.resolvedModelId(
+            engineOverrideId: selectedEngine,
+            cloudModelOverride: selectedModel
+        )
+    }
+    var resolvedEngine: TranscriptionEnginePlugin? {
+        guard let providerId = effectiveProviderId else { return nil }
+        guard let pluginManager = PluginManager.shared else { return nil }
+        return pluginManager.transcriptionEngine(for: providerId)
+    }
+    var selectedEngineSupportedLanguages: [String] {
+        resolvedEngine?.supportedLanguages.sorted() ?? []
+    }
     var selectedLanguage: String? { languageSelection.requestedLanguage }
     var canToggleRecording: Bool {
         Self.canToggleRecording(
@@ -126,16 +163,24 @@ final class AudioRecorderViewModel: ObservableObject {
     private let recorderService: AudioRecorderService
     private let modelManager: ModelManagerService
     private let dictionaryService: DictionaryService
+    private let defaults: UserDefaults
     private let streamingHandler: StreamingHandler
     private var cancellables = Set<AnyCancellable>()
     private var currentOutputURL: URL?
     private var activeRecorderAPISessionID: UUID?
     private var recorderAPISessions: [UUID: RecorderAPISessionSnapshot] = [:]
+    private var isInitialized = false
 
-    init(recorderService: AudioRecorderService, modelManager: ModelManagerService, dictionaryService: DictionaryService) {
+    init(
+        recorderService: AudioRecorderService,
+        modelManager: ModelManagerService,
+        dictionaryService: DictionaryService,
+        defaults: UserDefaults = .standard
+    ) {
         self.recorderService = recorderService
         self.modelManager = modelManager
         self.dictionaryService = dictionaryService
+        self.defaults = defaults
         self.streamingHandler = StreamingHandler(
             modelManager: modelManager,
             bufferProvider: { [weak recorderService] in
@@ -153,7 +198,6 @@ final class AudioRecorderViewModel: ObservableObject {
         )
 
         // Load saved preferences with defaults
-        let defaults = UserDefaults.standard
         if defaults.object(forKey: UserDefaultsKeys.recorderMicEnabled) == nil {
             self.micEnabled = true
         } else {
@@ -187,6 +231,8 @@ final class AudioRecorderViewModel: ObservableObject {
         } else {
             self.transcriptionEnabled = defaults.bool(forKey: UserDefaultsKeys.recorderTranscriptionEnabled)
         }
+        self.selectedEngine = defaults.string(forKey: UserDefaultsKeys.recorderTranscriptionEngine)
+        self.selectedModel = defaults.string(forKey: UserDefaultsKeys.recorderTranscriptionModel)
 
         recorderService.micDuckingMode = micDuckingMode
         recorderService.trackMode = trackMode
@@ -205,6 +251,9 @@ final class AudioRecorderViewModel: ObservableObject {
         streamingHandler.onStreamingStateChange = { [weak self] streaming in
             self?.isTranscribing = streaming
         }
+
+        isInitialized = true
+        reconcileSelectionWithAvailablePlugins()
     }
 
     private func setupBindings() {
@@ -227,6 +276,63 @@ final class AudioRecorderViewModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] value in self?.systemAudioWarningMessage = value }
             .store(in: &cancellables)
+
+        modelManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in
+                    self?.reconcileSelectionWithAvailablePlugins()
+                    self?.objectWillChange.send()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    func observePluginManager() {
+        guard let pluginManager = PluginManager.shared else { return }
+        pluginManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.reconcileSelectionWithAvailablePlugins()
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+    }
+
+    func canUseForTranscription(_ engine: TranscriptionEnginePlugin) -> Bool {
+        modelManager.canUseForTranscription(engine)
+    }
+
+    func reconcileSelectionWithAvailablePlugins() {
+        guard let pluginManager = PluginManager.shared else { return }
+        if let selectedEngine,
+           pluginManager.transcriptionEngine(for: selectedEngine) == nil {
+            self.selectedEngine = nil
+            selectedModel = nil
+        }
+        clearUnavailableSelectedModelForResolvedEngine()
+        normalizeLanguageSelectionForResolvedEngine()
+    }
+
+    private func clearUnavailableSelectedModelForResolvedEngine() {
+        guard let selectedModel else { return }
+        guard let engine = resolvedEngine else {
+            self.selectedModel = nil
+            return
+        }
+
+        let modelIds = Set((engine.modelCatalog + engine.transcriptionModels).map(\.id))
+        if !modelIds.contains(selectedModel) {
+            self.selectedModel = nil
+        }
+    }
+
+    private func normalizeLanguageSelectionForResolvedEngine() {
+        guard let engine = resolvedEngine else { return }
+        let normalized = languageSelection.normalizedForSupportedLanguages(engine.supportedLanguages)
+        if normalized != languageSelection {
+            languageSelection = normalized
+        }
     }
 
     nonisolated static func canToggleRecording(
@@ -297,6 +403,7 @@ final class AudioRecorderViewModel: ObservableObject {
         errorMessage = nil
         systemAudioWarningMessage = nil
         partialText = ""
+        reconcileSelectionWithAvailablePlugins()
         state = .recording
 
         let url: URL
@@ -348,14 +455,16 @@ final class AudioRecorderViewModel: ObservableObject {
 
             let finalTranscriptionRequest: FinalTranscriptionRequest?
             if transcriptionEnabled, let url {
+                reconcileSelectionWithAvailablePlugins()
+                let providerId = effectiveProviderId
                 finalTranscriptionRequest = FinalTranscriptionRequest(
                     outputURL: url,
                     buffer: recorderService.getCurrentBuffer(),
                     languageSelection: languageSelection,
                     task: selectedTask,
-                    providerId: modelManager.selectedProviderId,
-                    modelId: modelManager.selectedModelId,
-                    prompt: dictionaryService.getTermsForPrompt(providerId: modelManager.selectedProviderId),
+                    providerId: providerId,
+                    resolvedModelId: effectiveModelId,
+                    prompt: dictionaryService.getTermsForPrompt(providerId: providerId),
                     liveSessionResult: liveSessionResult
                 )
                 state = .finalizing
@@ -565,8 +674,13 @@ final class AudioRecorderViewModel: ObservableObject {
     // MARK: - Streaming Transcription
 
     private func startStreamingTranscription() {
-        guard let providerId = modelManager.selectedProviderId,
-              let plugin = PluginManager.shared.transcriptionEngine(for: providerId) else {
+        guard let pluginManager = PluginManager.shared else {
+            logger.info("Plugin manager unavailable, skipping live transcription")
+            return
+        }
+        reconcileSelectionWithAvailablePlugins()
+        guard let providerId = effectiveProviderId,
+              let plugin = pluginManager.transcriptionEngine(for: providerId) else {
             logger.info("No transcription engine available, skipping live transcription")
             return
         }
@@ -578,7 +692,7 @@ final class AudioRecorderViewModel: ObservableObject {
             selectedProviderId: modelManager.selectedProviderId,
             languageSelection: languageSelection,
             task: task,
-            cloudModelOverride: nil,
+            cloudModelOverride: effectiveModelId,
             allowLiveTranscription: true,
             stateCheck: { [weak self] in self?.state == .recording }
         )
@@ -607,7 +721,8 @@ final class AudioRecorderViewModel: ObservableObject {
         let effectiveTask: TranscriptionTask
         if request.task == .translate,
            let providerId = request.providerId,
-           let plugin = PluginManager.shared.transcriptionEngine(for: providerId),
+           let pluginManager = PluginManager.shared,
+           let plugin = pluginManager.transcriptionEngine(for: providerId),
            !plugin.supportsTranslation {
             effectiveTask = .transcribe
         } else {
@@ -623,7 +738,7 @@ final class AudioRecorderViewModel: ObservableObject {
                     languageSelection: request.languageSelection,
                     task: effectiveTask,
                     engineOverrideId: request.providerId,
-                    cloudModelOverride: request.modelId,
+                    cloudModelOverride: request.resolvedModelId,
                     prompt: request.prompt
                 )
             }
