@@ -20,6 +20,24 @@ final class SpeechPunctuationServiceTests: XCTestCase {
                   "verificationScenarios": []
                 }
                 """.data(using: .utf8)
+            case "ja":
+                return """
+                {
+                  "language": "ja",
+                  "rules": [
+                    { "phrase": "句点", "replacement": "。", "category": "punctuation" },
+                    { "phrase": "読点", "replacement": "、", "category": "punctuation" },
+                    { "phrase": "疑問符", "replacement": "？", "category": "punctuation" },
+                    { "phrase": "コロン", "replacement": "：", "category": "punctuation" },
+                    { "phrase": "セミコロン", "replacement": "；", "category": "punctuation" },
+                    { "phrase": "かっこ開く", "replacement": "（", "category": "brackets" },
+                    { "phrase": "かっこ閉じる", "replacement": "）", "category": "brackets" },
+                    { "phrase": "鍵かっこ開く", "replacement": "「", "category": "quotes" },
+                    { "phrase": "鍵かっこ閉じる", "replacement": "」", "category": "quotes" }
+                  ],
+                  "verificationScenarios": []
+                }
+                """.data(using: .utf8)
             default:
                 return nil
             }
@@ -71,6 +89,140 @@ final class SpeechPunctuationServiceTests: XCTestCase {
     }
 
     @MainActor
+    func testJapanesePunctuationCommandsRequireCommandBoundaries() {
+        let service = SpeechPunctuationService(rulesLoader: makeRulesLoader())
+
+        XCTAssertEqual(
+            service.normalize(text: "今日はいい天気です 句点", language: "ja"),
+            "今日はいい天気です。"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "今日はいい天気です句点", language: "ja"),
+            "今日はいい天気です句点"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "予約は明日ですか 疑問符", language: "ja"),
+            "予約は明日ですか？"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "こんにちは 読点 よろしくお願いします", language: "ja-JP"),
+            "こんにちは、よろしくお願いします"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "タイトル コロン 確認事項", language: "ja"),
+            "タイトル：確認事項"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "メモ かっこ開く 重要 かっこ閉じる", language: "ja"),
+            "メモ（重要）"
+        )
+    }
+
+    @MainActor
+    func testJapanesePunctuationCommandsRemoveRecognizerInsertedSpaces() {
+        let service = SpeechPunctuationService(rulesLoader: makeRulesLoader())
+
+        XCTAssertEqual(
+            service.normalize(text: "こんにちは 読点 よろしくお願いします", language: "ja"),
+            "こんにちは、よろしくお願いします"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "こんにちは 読点   よろしくお願いします", language: "ja"),
+            "こんにちは、よろしくお願いします"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "メモ かっこ開く 重要 かっこ閉じる", language: "ja"),
+            "メモ（重要）"
+        )
+    }
+
+    @MainActor
+    func testJapanesePunctuationPreservesSpaceBeforeLatinText() {
+        let service = SpeechPunctuationService(rulesLoader: makeRulesLoader())
+
+        XCTAssertEqual(
+            service.normalize(text: "これは TypeWhisper 疑問符 next", language: "ja"),
+            "これは TypeWhisper？ next"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "これは TypeWhisper 疑問符 2026", language: "ja"),
+            "これは TypeWhisper？ 2026"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "これは TypeWhisper 疑問符 𠮷田さん", language: "ja"),
+            "これは TypeWhisper？𠮷田さん"
+        )
+    }
+
+    @MainActor
+    func testJapanesePunctuationCommandsAvoidCommonWordSubstrings() {
+        let service = SpeechPunctuationService(rulesLoader: makeRulesLoader())
+
+        XCTAssertEqual(
+            service.normalize(text: "句点の使い方を説明します", language: "ja"),
+            "句点の使い方を説明します"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "疑問符の説明を確認します", language: "ja"),
+            "疑問符の説明を確認します"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "読点を入力する方法です", language: "ja"),
+            "読点を入力する方法です"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "読点は文の区切りです", language: "ja"),
+            "読点は文の区切りです"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "コロンの使い方を説明します", language: "ja"),
+            "コロンの使い方を説明します"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "コロンを説明します", language: "ja"),
+            "コロンを説明します"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "マイクロコロン", language: "ja"),
+            "マイクロコロン"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "セミコロンを入力する方法です", language: "ja"),
+            "セミコロンを入力する方法です"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "疑問符号の説明を確認します", language: "ja"),
+            "疑問符号の説明を確認します"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "コロンビアの予定を確認します", language: "ja"),
+            "コロンビアの予定を確認します"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "かっこ開く方法を説明します", language: "ja"),
+            "かっこ開く方法を説明します"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "鍵かっこ閉じる方法を説明します", language: "ja"),
+            "鍵かっこ閉じる方法を説明します"
+        )
+    }
+
+    @MainActor
+    func testJapaneseLongerBracketPhrasesTakePrecedence() {
+        let service = SpeechPunctuationService(rulesLoader: makeRulesLoader())
+
+        XCTAssertEqual(
+            service.normalize(text: "メモ 鍵かっこ開く 重要 鍵かっこ閉じる", language: "ja"),
+            "メモ「重要」"
+        )
+        XCTAssertEqual(
+            service.normalize(text: "メモ 鍵かっこ開く 重要 鍵かっこ閉じる", language: "ja-JP"),
+            "メモ「重要」"
+        )
+    }
+
+    @MainActor
     func testSpacingRulesHandleInlineAndClosingPunctuation() {
         let service = SpeechPunctuationService(rulesLoader: makeRulesLoader())
 
@@ -106,6 +258,28 @@ final class SpeechPunctuationServiceTests: XCTestCase {
         )
 
         XCTAssertEqual(output, "come stai?")
+    }
+
+    @MainActor
+    func testSelectiveFallbackAvoidsDuplicateJapanesePunctuationWithASCIIEquivalents() {
+        let service = SpeechPunctuationService(rulesLoader: makeRulesLoader())
+
+        XCTAssertEqual(
+            service.normalize(
+                text: "予約は明日ですか 疑問符?",
+                language: "ja",
+                mode: .selectiveFallback
+            ),
+            "予約は明日ですか?"
+        )
+        XCTAssertEqual(
+            service.normalize(
+                text: "予約は明日ですか? 疑問符",
+                language: "ja",
+                mode: .selectiveFallback
+            ),
+            "予約は明日ですか?"
+        )
     }
 
     @MainActor
