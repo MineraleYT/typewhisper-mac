@@ -511,6 +511,17 @@ final class TextInsertionService {
         )
     }
 
+    enum FocusedTextElementMatch: Equatable {
+        case same
+        case different
+        case unavailable
+    }
+
+    func focusedTextElementMatch(_ observation: FocusedTextObservation) -> FocusedTextElementMatch {
+        guard let focusedElement = getFocusedTextElement() else { return .unavailable }
+        return focusedElement == observation.element ? .same : .different
+    }
+
     func canRestoreClipboard(afterPasteUsing state: PasteVerificationState) -> Bool {
         guard let initialState = state.focusedTextState,
               let currentState = captureFocusedTextState(for: initialState.element) else {
