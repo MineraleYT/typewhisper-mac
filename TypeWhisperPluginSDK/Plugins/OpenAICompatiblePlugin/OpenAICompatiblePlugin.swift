@@ -480,7 +480,7 @@ final class OpenAICompatiblePlugin: NSObject,
             throw PluginTranscriptionError.noModelSelected
         }
 
-        return try await helper.transcribe(
+        return try await helper.transcribeCompressedAudioWithWavFallback(
             audio: audio,
             apiKey: apiKey(for: profileId) ?? "",
             modelName: modelId,
@@ -735,6 +735,33 @@ final class OpenAICompatiblePlugin: NSObject,
             : "api-key.\(canonicalProfileId(for: profileId))"
     }
 
+    enum OutputTokenParameter: String {
+        case maxTokens = "max_tokens"
+        case maxCompletionTokens = "max_completion_tokens"
+
+        var fallback: OutputTokenParameter {
+            switch self {
+            case .maxTokens:
+                .maxCompletionTokens
+            case .maxCompletionTokens:
+                .maxTokens
+            }
+        }
+    }
+
+    nonisolated static func fallbackOutputTokenParameter(
+        after parameter: OutputTokenParameter,
+        errorMessage: String
+    ) -> OutputTokenParameter? {
+        let lowered = errorMessage.lowercased()
+        let current = parameter.rawValue.lowercased()
+        let fallback = parameter.fallback.rawValue.lowercased()
+        guard lowered.contains(current), lowered.contains(fallback) else {
+            return nil
+        }
+        return parameter.fallback
+    }
+
     private func processChatCompletion(
         apiKey: String,
         baseURL: String,
@@ -750,17 +777,63 @@ final class OpenAICompatiblePlugin: NSObject,
             throw PluginChatError.apiError("Invalid URL: \(endpoint)")
         }
 
+        let outputTokenParameter = OutputTokenParameter.maxTokens
+        do {
+            return try await performChatCompletionRequest(
+                url: url,
+                apiKey: apiKey,
+                model: model,
+                systemPrompt: systemPrompt,
+                userText: userText,
+                temperature: temperature,
+                requestTimeout: requestTimeout,
+                thinkingEnabled: thinkingEnabled,
+                outputTokenParameter: outputTokenParameter
+            )
+        } catch let error as PluginChatError {
+            guard case .apiError(let message) = error,
+                  let fallback = Self.fallbackOutputTokenParameter(
+                    after: outputTokenParameter,
+                    errorMessage: message
+                  ) else {
+                throw error
+            }
+            return try await performChatCompletionRequest(
+                url: url,
+                apiKey: apiKey,
+                model: model,
+                systemPrompt: systemPrompt,
+                userText: userText,
+                temperature: temperature,
+                requestTimeout: requestTimeout,
+                thinkingEnabled: thinkingEnabled,
+                outputTokenParameter: fallback
+            )
+        }
+    }
+
+    private func performChatCompletionRequest(
+        url: URL,
+        apiKey: String,
+        model: String,
+        systemPrompt: String,
+        userText: String,
+        temperature: Double?,
+        requestTimeout: TimeInterval,
+        thinkingEnabled: Bool,
+        outputTokenParameter: OutputTokenParameter
+    ) async throws -> String {
         var requestBody: [String: Any] = [
             "model": model,
             "messages": [
                 ["role": "system", "content": systemPrompt],
                 ["role": "user", "content": userText],
             ],
-            "max_tokens": 4096,
             "thinking": [
                 "type": thinkingEnabled ? "enabled" : "disabled"
             ],
         ]
+        requestBody[outputTokenParameter.rawValue] = 4096
         if let temperature {
             requestBody["temperature"] = temperature
         }

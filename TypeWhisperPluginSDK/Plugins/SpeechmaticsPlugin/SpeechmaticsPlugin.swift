@@ -182,18 +182,20 @@ final class SpeechmaticsPlugin: NSObject, TranscriptionEnginePlugin, DictionaryT
         apiKey: String,
         prompt: String?
     ) async throws -> PluginTranscriptionResult {
-        let jobId = try await submitJob(
-            wavData: audio.wavData,
-            language: language,
-            modelId: modelId,
-            apiKey: apiKey,
-            prompt: prompt
-        )
+        let jobId = try await PluginAudioUploadEncoder.withCompressedM4AUploadWavFallback(from: audio) { uploadFile in
+            try await submitJob(
+                uploadFile: uploadFile,
+                language: language,
+                modelId: modelId,
+                apiKey: apiKey,
+                prompt: prompt
+            )
+        }
         return try await pollJob(jobId: jobId, apiKey: apiKey)
     }
 
     private func submitJob(
-        wavData: Data,
+        uploadFile: PluginAudioUploadFile,
         language: String?,
         modelId: String,
         apiKey: String,
@@ -230,9 +232,9 @@ final class SpeechmaticsPlugin: NSObject, TranscriptionEnginePlugin, DictionaryT
         body.append("\r\n".data(using: .utf8)!)
         // Audio part
         body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"data_file\"; filename=\"audio.wav\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
-        body.append(wavData)
+        body.append("Content-Disposition: form-data; name=\"data_file\"; filename=\"\(uploadFile.filename)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(uploadFile.contentType)\r\n\r\n".data(using: .utf8)!)
+        body.append(uploadFile.data)
         body.append("\r\n".data(using: .utf8)!)
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
 

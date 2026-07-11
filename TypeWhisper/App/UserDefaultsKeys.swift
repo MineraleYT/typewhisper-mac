@@ -15,6 +15,7 @@ enum UserDefaultsKeys {
     static let indicatorTranscriptPreviewFontSizeOffset = "indicatorTranscriptPreviewFontSizeOffset"
     static let preserveClipboard = "preserveClipboard"
     static let mediaPauseEnabled = "mediaPauseEnabled"
+    static let dictationHotkeysPaused = "dictationHotkeysPaused"
     static let transcribeShortQuietClipsAggressively = "transcribeShortQuietClipsAggressively"
     static let microphoneBoostEnabled = "microphoneBoostEnabled"
 
@@ -57,6 +58,7 @@ enum UserDefaultsKeys {
 
     // MARK: - Audio Device
     static let selectedInputDeviceUID = "selectedInputDeviceUID"
+    static let inputDevicePriorityList = "inputDevicePriorityList"
 
     // MARK: - Home / Setup
     static let setupWizardCompleted = "setupWizardCompleted"
@@ -127,6 +129,7 @@ enum UserDefaultsKeys {
     static let dictationRecoveryEngine = "dictationRecoveryEngine"
     static let dictationRecoveryModel = "dictationRecoveryModel"
     static let dictationRecoveryLanguage = "dictationRecoveryLanguage"
+    static let dictationRecoveryAutomaticFallbackEnabled = "dictationRecoveryAutomaticFallbackEnabled"
 
     // MARK: - Watch Folder
     static let watchFolderBookmark = "watchFolderBookmark"
@@ -139,6 +142,8 @@ enum UserDefaultsKeys {
     static let watchFolderModel = "watchFolderModel"
 
     // MARK: - Workflows
+    static let llmFallbackPriorityList = "llmFallbackPriorityList"
+    // Legacy values retained solely as migration inputs for llmFallbackPriorityList.
     static let workflowDefaultLLMProviderId = "workflowDefaultLLMProviderId"
     static let workflowDefaultLLMCloudModel = "workflowDefaultLLMCloudModel"
     static let workflowShortTranscriptionMinimumWords = "workflowShortTranscriptionMinimumWords"

@@ -70,9 +70,81 @@ enum DictationTranscriptionOverrideResolver {
     }
 }
 
+enum AutomaticRecoveryFallbackErrorPolicy {
+    static func shouldAttempt(after error: Error, taskIsCancelled: Bool = Task.isCancelled) -> Bool {
+        guard !(error is CancellationError), !taskIsCancelled else { return false }
+
+        if let pluginError = error as? PluginTranscriptionError {
+            switch pluginError {
+            case .fileTooLarge:
+                return false
+            case .notConfigured,
+                 .noModelSelected,
+                 .invalidApiKey,
+                 .rateLimited,
+                 .apiError(_),
+                 .networkError(_):
+                return true
+            }
+        }
+
+        if let transcriptionError = error as? TranscriptionEngineError {
+            switch transcriptionError {
+            case .unsupportedTask(_):
+                return false
+            case .modelNotLoaded,
+                 .appleSpeechModelNotLoaded,
+                 .transcriptionFailed(_),
+                 .modelLoadFailed(_),
+                 .modelDownloadFailed(_):
+                return true
+            }
+        }
+
+        if let urlError = error as? URLError {
+            return urlError.code != .cancelled
+        }
+
+        return false
+    }
+}
+
 /// Orchestrates the dictation flow: recording → transcription → text insertion.
 @MainActor
 final class DictationViewModel: ObservableObject {
+    typealias RecoveryFallbackConfigurationProvider = @MainActor (
+        _ primaryEngineId: String?,
+        _ task: TranscriptionTask
+    ) -> DictationRecoveryFallbackConfiguration?
+    typealias RecoveryFallbackRunner = @MainActor (
+        _ samples: [Float],
+        _ languageSelection: LanguageSelection,
+        _ task: TranscriptionTask,
+        _ configuration: DictationRecoveryFallbackConfiguration,
+        _ prompt: String?,
+        _ dictionaryTermHints: [PluginDictionaryTermHint],
+        _ normalizeNumbers: Bool?
+    ) async throws -> TranscriptionResult
+
+    private struct FinalTranscriptionOutput {
+        let result: TranscriptionResult
+        let modelId: String?
+        let modelDisplayName: String?
+        let usedRecoveryFallback: Bool
+    }
+
+    private struct AutomaticRecoveryFallbackFailure: LocalizedError {
+        let primaryDescription: String
+        let fallbackDescription: String
+
+        var errorDescription: String? {
+            localizedAppText(
+                "Primary transcription failed: \(primaryDescription). Recovery fallback failed: \(fallbackDescription)",
+                de: "Primäre Transkription fehlgeschlagen: \(primaryDescription). Recovery-Fallback fehlgeschlagen: \(fallbackDescription)"
+            )
+        }
+    }
+
     nonisolated(unsafe) static var _shared: DictationViewModel?
     static var shared: DictationViewModel {
         guard let instance = _shared else {
@@ -198,6 +270,7 @@ final class DictationViewModel: ObservableObject {
     private let modelManager: ModelManagerService
     private let settingsViewModel: SettingsViewModel
     private let historyService: HistoryService
+    private let usageStatisticsRecorder: UsageStatisticsRecording?
     private let recentTranscriptionStore: RecentTranscriptionStore
     private let profileService: ProfileService
     private let workflowService: WorkflowService
@@ -217,6 +290,8 @@ final class DictationViewModel: ObservableObject {
     private let errorLogService: ErrorLogService
     private let mediaPlaybackService: MediaPlaybackService
     private let postProcessingPipeline: PostProcessingPipeline
+    private let recoveryFallbackConfigurationProvider: RecoveryFallbackConfigurationProvider
+    private let recoveryFallbackRunner: RecoveryFallbackRunner
     private var matchedWorkflow: Workflow?
     private var activeWorkflowMatch: WorkflowMatchResult?
     private var forcedWorkflowId: UUID?
@@ -231,6 +306,7 @@ final class DictationViewModel: ObservableObject {
     private let recentTranscriptionPaletteHandler: RecentTranscriptionPaletteHandler
     private let settingsHandler: DictationSettingsHandler
     private var transcriptionTask: Task<Void, Never>?
+    private var stopFinalizationTask: Task<Void, Never>?
     private var targetAppCorrectionLearningTask: Task<Void, Never>?
     private var pendingLearnedCorrections: [LearnedDictionaryCorrection] = []
     private var errorResetTask: Task<Void, Never>?
@@ -304,7 +380,10 @@ final class DictationViewModel: ObservableObject {
         speechFeedbackService: SpeechFeedbackService,
         accessibilityAnnouncementService: AccessibilityAnnouncementService,
         errorLogService: ErrorLogService,
-        mediaPlaybackService: MediaPlaybackService
+        mediaPlaybackService: MediaPlaybackService,
+        usageStatisticsRecorder: UsageStatisticsRecording? = nil,
+        recoveryFallbackConfigurationProvider: RecoveryFallbackConfigurationProvider? = nil,
+        recoveryFallbackRunner: RecoveryFallbackRunner? = nil
     ) {
         self.audioRecordingService = audioRecordingService
         self.textInsertionService = textInsertionService
@@ -312,6 +391,7 @@ final class DictationViewModel: ObservableObject {
         self.modelManager = modelManager
         self.settingsViewModel = settingsViewModel
         self.historyService = historyService
+        self.usageStatisticsRecorder = usageStatisticsRecorder
         self.recentTranscriptionStore = recentTranscriptionStore
         self.profileService = profileService
         self.workflowService = workflowService
@@ -340,6 +420,19 @@ final class DictationViewModel: ObservableObject {
         self.accessibilityAnnouncementService = accessibilityAnnouncementService
         self.errorLogService = errorLogService
         self.mediaPlaybackService = mediaPlaybackService
+        self.recoveryFallbackConfigurationProvider = recoveryFallbackConfigurationProvider ?? { _, _ in nil }
+        self.recoveryFallbackRunner = recoveryFallbackRunner ?? { [modelManager] samples, languageSelection, task, configuration, prompt, dictionaryTermHints, normalizeNumbers in
+            try await modelManager.transcribe(
+                audioSamples: samples,
+                languageSelection: languageSelection,
+                task: task,
+                engineOverrideId: configuration.engineId,
+                cloudModelOverride: configuration.modelId,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                normalizeNumbers: normalizeNumbers
+            )
+        }
         self.postProcessingPipeline = PostProcessingPipeline(
             snippetService: snippetService,
             dictionaryService: dictionaryService,
@@ -750,11 +843,15 @@ final class DictationViewModel: ObservableObject {
 
     private func setupBindings() {
         hotkeyService.onDictationStart = { [weak self] requestTimestamp in
-            self?.startRecording(requestUptimeNanoseconds: requestTimestamp)
+            guard let self else { return }
+            logger.info("hotkey→onDictationStart (state=\(String(describing: self.state), privacy: .public))")
+            self.startRecording(requestUptimeNanoseconds: requestTimestamp)
         }
 
         hotkeyService.onDictationStop = { [weak self] in
-            self?.stopDictation()
+            guard let self else { return }
+            logger.info("hotkey→onDictationStop (state=\(String(describing: self.state), privacy: .public), stopInFlight=\(String(describing: self.isStopInFlight), privacy: .public))")
+            self.stopDictation()
         }
 
         hotkeyService.onWorkflowDictationStart = { [weak self] workflowId, requestTimestamp in
@@ -880,6 +977,10 @@ final class DictationViewModel: ObservableObject {
             showNotchFeedback(message: cancelledMessage, icon: "xmark.circle", duration: 1.5)
         case .processing:
             cancelActiveDictationSessionIfNeeded(message: cancelledMessage)
+            stopFinalizationTask?.cancel()
+            stopFinalizationTask = nil
+            streamingHandler.stop()
+            lastStreamingParams = nil
             transcriptionTask?.cancel()
             transcriptionTask = nil
             audioRecordingService.discardActiveRecoveryRecording()
@@ -894,6 +995,12 @@ final class DictationViewModel: ObservableObject {
         sessionID: UUID = UUID(),
         requestUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
+        guard state == .idle else {
+            logger.warning("startRecording rejected: state=\(String(describing: self.state), privacy: .public); resetting hotkey state")
+            hotkeyService.cancelDictation()
+            return
+        }
+
         let startTimestamp = CFAbsoluteTimeGetCurrent()
         clearRecordingStartCueState()
 
@@ -919,24 +1026,34 @@ final class DictationViewModel: ObservableObject {
 
         guard canDictate else {
             let errorMessage = TranscriptionEngineError.modelNotLoaded.localizedDescription
+            logger.warning("startRecording rejected: canDictate=false; resetting hotkey state")
             failDictationSession(id: sessionID, error: errorMessage)
             showError(errorMessage, category: "recording")
+            // Resync the hotkey toggle: HotkeyService already flipped isActive=true
+            // before invoking onDictationStart. Without this, a rejected start leaves
+            // the toggle stuck "active", so the next press is consumed as a phantom
+            // stop and every subsequent start/stop needs an extra press.
+            hotkeyService.cancelDictation()
             return
         }
 
         guard audioRecordingService.hasMicrophonePermission else {
             let errorMessage = "Microphone permission required."
+            logger.warning("startRecording rejected: microphone permission missing; resetting hotkey state")
             failDictationSession(id: sessionID, error: errorMessage)
             showError(errorMessage, category: "recording")
+            hotkeyService.cancelDictation()
             return
         }
+
+        let resolvedInputSelection = audioDeviceService.resolvedRecordingInputSelection()
 
         do {
             let initialForcedWorkflow = forcedWorkflow(for: forcedWorkflowId)
             audioRecordingService.microphoneBoostEnabled = microphoneBoostEnabled(for: initialForcedWorkflow)
-            audioRecordingService.selectedDeviceID = audioDeviceService.selectedDeviceID
-            audioRecordingService.hasExplicitDeviceSelection = audioDeviceService.selectedDeviceUID != nil
-            let selectedInputUsesBluetooth = audioDeviceService.selectedDeviceUsesBluetoothTransport
+            audioRecordingService.selectedDeviceID = resolvedInputSelection.deviceID
+            audioRecordingService.hasExplicitDeviceSelection = resolvedInputSelection.hasExplicitDeviceSelection
+            let selectedInputUsesBluetooth = resolvedInputSelection.usesBluetoothTransport
             audioRecordingService.selectedInputDeviceUsesBluetoothTransport = selectedInputUsesBluetooth
             prepareRecordingStartCue(playsSound: !selectedInputUsesBluetooth)
             let audioStartTimestamp = DispatchTime.now().uptimeNanoseconds
@@ -1011,7 +1128,10 @@ final class DictationViewModel: ObservableObject {
                 errorMessage = String(localized: "No mic detected.")
             } else if let recordingError = error as? AudioRecordingService.AudioRecordingError,
                       case .selectedInputDeviceIncompatible(let issue) = recordingError {
-                audioDeviceService.markSelectedDeviceCompatibility(.incompatible(issue))
+                audioDeviceService.markRecordingInputSelectionCompatibility(
+                    .incompatible(issue),
+                    selection: resolvedInputSelection
+                )
                 errorMessage = recordingError.localizedDescription
             } else {
                 errorMessage = error.localizedDescription
@@ -1169,12 +1289,22 @@ final class DictationViewModel: ObservableObject {
         guard state == .recording, !isStopInFlight else { return }
         clearCancelWarning()
         isStopInFlight = true
-        Task {
+        state = .processing
+        processingPhase = String(localized: "Processing...")
+        markActiveDictationSessionProcessingIfNeeded()
+        stopFinalizationTask = Task { [weak self] in
+            guard let self else { return }
             await finalizeStopDictation()
         }
     }
 
     private func finalizeStopDictation() async {
+        defer {
+            if Task.isCancelled {
+                isStopInFlight = false
+            }
+            stopFinalizationTask = nil
+        }
         let sessionID = activeDictationSessionID
 
         clearRecordingStartCueState(resetReadiness: false)
@@ -1197,12 +1327,24 @@ final class DictationViewModel: ObservableObject {
             return
         }
 
-        let liveSessionResult = await streamingHandler.finish()
+        let stopStart = CFAbsoluteTimeGetCurrent()
+        func stopElapsedMs() -> String { String(format: "%.0f", (CFAbsoluteTimeGetCurrent() - stopStart) * 1000) }
+
+        let streamingParams = lastStreamingParams
         lastStreamingParams = nil
         stopRecordingTimer()
         let previewText = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stopPolicy = AudioRecordingService.StopPolicy.finalizeShortSpeech()
+        var samples = await audioRecordingService.stopRecording(policy: stopPolicy)
+        guard !Task.isCancelled else { return }
+        logger.info("Stop timing: stopRecording done elapsedMs=\(stopElapsedMs(), privacy: .public), previewTextLength=\(previewText.count, privacy: .public)")
+        let liveSessionResultBeforePreviewFallback = await streamingHandler.finish(finalSamples: samples)
+        guard !Task.isCancelled else { return }
+        logger.info("Stop timing: streamingHandler.finish done elapsedMs=\(stopElapsedMs(), privacy: .public), resultTextLength=\(liveSessionResultBeforePreviewFallback?.text.count ?? -1, privacy: .public)")
+        var liveSessionResult = liveSessionResultBeforePreviewFallback.map {
+            StreamingHandler.resultPreferringStablePreviewIfNeeded($0, stablePreview: previewText)
+        }
         let hasPreviewText = !previewText.isEmpty
-        let hasConfirmedText = hasConfirmedTranscriptionResultText(liveSessionResult)
 
         if !partialText.isEmpty {
             let elapsed = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
@@ -1213,10 +1355,17 @@ final class DictationViewModel: ObservableObject {
             )))
         }
 
-        let stopPolicy = AudioRecordingService.StopPolicy.finalizeShortSpeech()
-        var samples = await audioRecordingService.stopRecording(policy: stopPolicy)
         let peakLevel = audioRecordingService.peakRawAudioLevel
         let rawDuration = Double(samples.count) / AudioRecordingService.targetSampleRate
+        if !hasConfirmedTranscriptionResultText(liveSessionResult),
+           let previewResult = stableLivePreviewFallbackResult(
+            previewText: previewText,
+            streamingParams: streamingParams,
+            duration: rawDuration
+           ) {
+            liveSessionResult = previewResult
+        }
+        let hasConfirmedText = hasConfirmedTranscriptionResultText(liveSessionResult)
         let decision = classifyShortSpeech(
             rawDuration: rawDuration,
             peakLevel: peakLevel,
@@ -1269,14 +1418,17 @@ final class DictationViewModel: ObservableObject {
             durationSeconds: audioDuration
         )))
 
-        state = .processing
-        processingPhase = String(localized: "Transcribing...")
-        markActiveDictationSessionProcessingIfNeeded()
+        processingPhase = liveSessionResult == nil
+            ? String(localized: "Transcribing...")
+            : String(localized: "Processing...")
 
+        guard !Task.isCancelled else { return }
+        let usedLiveSessionResult = liveSessionResult != nil
         transcriptionTask = Task {
             do {
                 // Wait for browser URL resolution so URL-based profile overrides apply
                 await urlResolutionTask?.value
+                logger.info("Stop timing: urlResolutionTask done elapsedMs=\(stopElapsedMs(), privacy: .public)")
 
                 let activeApp = capturedActiveApp ?? textInsertionService.captureActiveApp()
                 let resolvedOutputFormat = self.resolvedEffectiveOutputFormat(for: activeApp)
@@ -1287,23 +1439,38 @@ final class DictationViewModel: ObservableObject {
                 let engineOverride = effectiveEngineOverrideId
                 let cloudModelOverride = effectiveCloudModelOverride
                 let translationTarget = effectiveTranslationTarget
-                let termsPrompt = dictionaryService.getTermsForPrompt(
-                    providerId: engineOverride ?? modelManager.selectedProviderId
-                )
+                let primaryEngineId = engineOverride ?? modelManager.selectedProviderId
+                let dictionaryProviderId = primaryEngineId
+                let termsPrompt = dictionaryService.getTermsForPrompt(providerId: dictionaryProviderId)
+                let termHints = dictionaryService.getTermHints(providerId: dictionaryProviderId)
 
-                let result = if let liveSessionResult {
-                    liveSessionResult
+                let transcription = if let liveSessionResult {
+                    FinalTranscriptionOutput(
+                        result: liveSessionResult,
+                        modelId: modelManager.resolvedModelId(
+                            engineOverrideId: engineOverride,
+                            cloudModelOverride: cloudModelOverride
+                        ),
+                        modelDisplayName: modelManager.resolvedModelDisplayName(
+                            engineOverrideId: engineOverride,
+                            cloudModelOverride: cloudModelOverride
+                        ),
+                        usedRecoveryFallback: false
+                    )
                 } else {
-                    try await modelManager.transcribe(
+                    try await transcribeFinalAudio(
                         audioSamples: samples,
                         languageSelection: languageSelection,
                         task: task,
-                        engineOverrideId: engineOverride,
-                        cloudModelOverride: cloudModelOverride,
+                        primaryEngineId: primaryEngineId,
+                        primaryCloudModelOverride: cloudModelOverride,
                         prompt: termsPrompt,
+                        dictionaryTermHints: termHints,
                         normalizeNumbers: effectiveNumberNormalizationOverride
                     )
                 }
+                let result = transcription.result
+                logger.info("Stop timing: final transcription ready elapsedMs=\(stopElapsedMs(), privacy: .public), usedLiveResult=\(usedLiveSessionResult, privacy: .public)")
 
                 // Bail out if a new recording started while we were transcribing
                 guard !Task.isCancelled else { return }
@@ -1356,10 +1523,7 @@ final class DictationViewModel: ObservableObject {
                 )
                 let dictationContext = DictationRuntimeContext(
                     engineId: result.engineUsed,
-                    modelId: modelManager.resolvedModelId(
-                        engineOverrideId: engineOverride,
-                        cloudModelOverride: cloudModelOverride
-                    ),
+                    modelId: transcription.modelId,
                     configuredLanguage: language,
                     configuredLanguageCandidates: languageCandidates,
                     detectedLanguage: result.detectedLanguage
@@ -1371,6 +1535,7 @@ final class DictationViewModel: ObservableObject {
                     normalizeNumbers: self.effectiveNumberNormalizationOverride
                 )
                 text = ppResult.text
+                logger.info("Stop timing: post-processing done elapsedMs=\(stopElapsedMs(), privacy: .public)")
                 let transcriptionID = sessionID ?? UUID()
                 let completionTimestamp = Date()
                 recentTranscriptionStore.recordTranscription(
@@ -1409,6 +1574,7 @@ final class DictationViewModel: ObservableObject {
                         autoEnter: self.effectiveAutoEnterEnabled,
                         outputFormat: resolvedOutputFormat
                     )
+                    logger.info("Stop timing: text inserted elapsedMs=\(stopElapsedMs(), privacy: .public)")
                     if case .pasted(.unverified(let reason)) = insertionResult {
                         logger.info(
                             "Text insertion paste could not be verified; continuing with clipboard paste fallback. reason=\(reason.rawValue, privacy: .public), app=\(activeApp.bundleId ?? "nil", privacy: .public)"
@@ -1428,10 +1594,11 @@ final class DictationViewModel: ObservableObject {
                     )))
                 }
 
-                let modelDisplayName = modelManager.resolvedModelDisplayName(
-                    engineOverrideId: engineOverride,
-                    cloudModelOverride: cloudModelOverride
-                )
+                let modelDisplayName = transcription.modelDisplayName
+                var pipelineSteps = ppResult.appliedSteps
+                if transcription.usedRecoveryFallback {
+                    pipelineSteps.append(localizedAppText("Recovery fallback", de: "Recovery-Fallback"))
+                }
 
                 if UserDefaults.standard.object(forKey: UserDefaultsKeys.historyEnabled) as? Bool ?? true {
                     historyService.addRecord(
@@ -1446,7 +1613,7 @@ final class DictationViewModel: ObservableObject {
                         engineUsed: result.engineUsed,
                         modelUsed: modelDisplayName,
                         audioSamples: audioSamplesForHistory,
-                        pipelineSteps: ppResult.appliedSteps.isEmpty ? nil : ppResult.appliedSteps
+                        pipelineSteps: pipelineSteps.isEmpty ? nil : pipelineSteps
                     )
                 }
 
@@ -1466,6 +1633,12 @@ final class DictationViewModel: ObservableObject {
                 audioRecordingService.discardActiveRecoveryRecording()
                 soundService.play(.transcriptionSuccess, enabled: soundFeedbackEnabled)
                 let wordCount = text.split(separator: " ").count
+                usageStatisticsRecorder?.recordTranscription(
+                    timestamp: completionTimestamp,
+                    wordsCount: wordCount,
+                    durationSeconds: audioDuration,
+                    appBundleIdentifier: activeApp.bundleId
+                )
                 let detectedLang = result.detectedLanguage ?? language
                 let completedTranscription = DictationSessionTranscription(
                     text: text,
@@ -1515,6 +1688,140 @@ final class DictationViewModel: ObservableObject {
             }
             self.transcriptionTask = nil
         }
+        stopFinalizationTask = nil
+    }
+
+    private func stableLivePreviewFallbackResult(
+        previewText: String,
+        streamingParams: StreamingParamsSnapshot?,
+        duration: Double
+    ) -> TranscriptionResult? {
+        let preview = previewText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let streamingParams,
+              streamingProviderSupportsLiveSession(streamingParams),
+              StreamingHandler.isSubstantiveStablePreview(preview) else {
+            return nil
+        }
+
+        let engineUsed = streamingParams.engineOverrideId
+            ?? streamingParams.providerId
+            ?? "unknown"
+        logger.info("Using stable live preview as final text because live finalization returned no usable text")
+        return TranscriptionNormalizationService.normalizeResult(
+            text: preview,
+            detectedLanguage: nil,
+            configuredLanguage: streamingParams.languageSelection.requestedLanguage,
+            configuredLanguageCandidates: streamingParams.languageSelection.selectedCodes,
+            duration: duration,
+            processingTime: 0.001,
+            engineUsed: engineUsed,
+            segments: [],
+            task: streamingParams.task,
+            normalizeNumbers: streamingParams.normalizeNumbers
+        )
+    }
+
+    private func streamingProviderSupportsLiveSession(_ streamingParams: StreamingParamsSnapshot) -> Bool {
+        guard let providerId = streamingParams.engineOverrideId ?? streamingParams.providerId,
+              let plugin = PluginManager.shared.transcriptionEngine(for: providerId) else {
+            return false
+        }
+        return plugin is any LiveTranscriptionCapablePlugin
+    }
+
+    private func transcribeFinalAudio(
+        audioSamples: [Float],
+        languageSelection: LanguageSelection,
+        task: TranscriptionTask,
+        primaryEngineId: String?,
+        primaryCloudModelOverride: String?,
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
+        normalizeNumbers: Bool?
+    ) async throws -> FinalTranscriptionOutput {
+        do {
+            let result = try await modelManager.transcribe(
+                audioSamples: audioSamples,
+                languageSelection: languageSelection,
+                task: task,
+                engineOverrideId: primaryEngineId,
+                cloudModelOverride: primaryCloudModelOverride,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                normalizeNumbers: normalizeNumbers
+            )
+            return finalTranscriptionOutput(
+                result: result,
+                engineId: primaryEngineId,
+                modelId: primaryCloudModelOverride,
+                usedRecoveryFallback: false
+            )
+        } catch {
+            let primaryError = error
+            guard shouldAttemptAutomaticRecoveryFallback(after: primaryError),
+                  let configuration = recoveryFallbackConfigurationProvider(primaryEngineId, task) else {
+                throw primaryError
+            }
+
+            logger.warning(
+                "Primary transcription failed; retrying with recovery fallback engine \(configuration.engineId, privacy: .public): \(primaryError.localizedDescription, privacy: .public)"
+            )
+            let fallbackPrompt = dictionaryService.getTermsForPrompt(providerId: configuration.engineId)
+            let fallbackDictionaryTermHints = dictionaryService.getTermHints(providerId: configuration.engineId)
+
+            do {
+                let fallbackResult = try await recoveryFallbackRunner(
+                    audioSamples,
+                    languageSelection,
+                    task,
+                    configuration,
+                    fallbackPrompt,
+                    fallbackDictionaryTermHints,
+                    normalizeNumbers
+                )
+                logger.info(
+                    "Recovery fallback transcription succeeded with engine \(configuration.engineId, privacy: .public)"
+                )
+                return finalTranscriptionOutput(
+                    result: fallbackResult,
+                    engineId: configuration.engineId,
+                    modelId: configuration.modelId,
+                    usedRecoveryFallback: true
+                )
+            } catch {
+                logger.error(
+                    "Recovery fallback transcription failed with engine \(configuration.engineId, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+                throw AutomaticRecoveryFallbackFailure(
+                    primaryDescription: primaryError.localizedDescription,
+                    fallbackDescription: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func finalTranscriptionOutput(
+        result: TranscriptionResult,
+        engineId: String?,
+        modelId: String?,
+        usedRecoveryFallback: Bool
+    ) -> FinalTranscriptionOutput {
+        FinalTranscriptionOutput(
+            result: result,
+            modelId: modelManager.resolvedModelId(
+                engineOverrideId: engineId,
+                cloudModelOverride: modelId
+            ),
+            modelDisplayName: modelManager.resolvedModelDisplayName(
+                engineOverrideId: engineId,
+                cloudModelOverride: modelId
+            ),
+            usedRecoveryFallback: usedRecoveryFallback
+        )
+    }
+
+    private func shouldAttemptAutomaticRecoveryFallback(after error: Error) -> Bool {
+        AutomaticRecoveryFallbackErrorPolicy.shouldAttempt(after: error)
     }
 
     func requestMicPermission() { settingsHandler.requestMicPermission() }
@@ -1543,6 +1850,10 @@ final class DictationViewModel: ObservableObject {
         errorResetTask?.cancel()
         insertingResetTask?.cancel()
         insertingResetTask = nil
+        stopFinalizationTask?.cancel()
+        stopFinalizationTask = nil
+        transcriptionTask?.cancel()
+        transcriptionTask = nil
         urlResolutionTask?.cancel()
         urlResolutionTask = nil
         metadataCaptureTask?.cancel()
@@ -1610,10 +1921,10 @@ final class DictationViewModel: ObservableObject {
             normalizeNumbers: effectiveNumberNormalizationOverride
         )
         lastStreamingParams = allowLiveTranscription ? params : nil
+        let dictionaryProviderId = params.engineOverrideId ?? params.providerId
         streamingHandler.start(
-            streamPrompt: dictionaryService.getTermsForPrompt(
-                providerId: params.engineOverrideId ?? params.providerId
-            ) ?? "",
+            streamPrompt: dictionaryService.getTermsForPrompt(providerId: dictionaryProviderId) ?? "",
+            dictionaryTermHints: dictionaryService.getTermHints(providerId: dictionaryProviderId),
             engineOverrideId: params.engineOverrideId,
             selectedProviderId: params.providerId,
             languageSelection: params.languageSelection,
@@ -1957,13 +2268,13 @@ final class DictationViewModel: ObservableObject {
         let message: String
         if learned.count == 1, let correction = learned.first {
             message = String.localizedStringWithFormat(
-                String(localized: "Learned “%@” -> “%@”"),
+                String(localized: "Saved to Dictionary: “%@” -> “%@”"),
                 correction.original,
                 correction.replacement
             )
         } else {
             message = String.localizedStringWithFormat(
-                String(localized: "Learned %d corrections"),
+                String(localized: "Saved %d corrections to Dictionary"),
                 learned.count
             )
         }
@@ -1971,7 +2282,7 @@ final class DictationViewModel: ObservableObject {
         showNotchFeedback(
             message: message,
             icon: "wand.and.sparkles",
-            duration: 8.0,
+            duration: 12.0,
             undoTitle: String(localized: "Undo")
         )
     }
@@ -2077,7 +2388,7 @@ enum DictationInsertionTextFormatter {
         contextualInsertionEnabled: Bool = true
     ) -> String {
         guard contextualInsertionEnabled, let insertionContext else {
-            return textWithTrailingSpaceIfNeeded(text)
+            return text
         }
 
         let boundaries = insertionBoundaries(for: insertionContext)
@@ -2100,17 +2411,9 @@ enum DictationInsertionTextFormatter {
                shouldInsertSpace(between: last, and: next) {
                 result += " "
             }
-        } else {
-            result = textWithTrailingSpaceIfNeeded(result)
         }
 
         return result
-    }
-
-    private static func textWithTrailingSpaceIfNeeded(_ text: String) -> String {
-        guard let lastScalar = text.unicodeScalars.last else { return text }
-        guard !CharacterSet.whitespacesAndNewlines.contains(lastScalar) else { return text }
-        return text + " "
     }
 
     private struct InsertionBoundaries {

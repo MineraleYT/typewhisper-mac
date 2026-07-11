@@ -112,7 +112,9 @@ final class DictionaryService: ObservableObject {
         type: DictionaryEntryType,
         original: String,
         replacement: String? = nil,
-        caseSensitive: Bool = false
+        caseSensitive: Bool = false,
+        ctcMinSimilarity: Float? = nil,
+        source: DictionaryEntrySource = .manual
     ) {
         guard let context = modelContext else { return }
 
@@ -127,6 +129,8 @@ final class DictionaryService: ObservableObject {
             original: original,
             replacement: replacement,
             caseSensitive: caseSensitive,
+            ctcMinSimilarity: Self.normalizedCtcMinSimilarity(type == .term ? ctcMinSimilarity : nil),
+            source: source,
             createdAt: now,
             updatedAt: now
         )
@@ -145,13 +149,15 @@ final class DictionaryService: ObservableObject {
         _ entry: DictionaryEntry,
         original: String,
         replacement: String?,
-        caseSensitive: Bool
+        caseSensitive: Bool,
+        ctcMinSimilarity: Float? = nil
     ) {
         guard let context = modelContext else { return }
 
         entry.original = original
         entry.replacement = replacement
         entry.caseSensitive = caseSensitive
+        entry.ctcMinSimilarity = Self.normalizedCtcMinSimilarity(entry.type == .term ? ctcMinSimilarity : nil)
         entry.updatedAt = Date()
 
         do {
@@ -189,24 +195,65 @@ final class DictionaryService: ObservableObject {
         }
     }
 
+    func setEntryEnabled(_ entry: DictionaryEntry, enabled: Bool) {
+        guard let context = modelContext else { return }
+        guard entry.isEnabled != enabled else { return }
+
+        let previousEnabled = entry.isEnabled
+        let previousUpdatedAt = entry.updatedAt
+        entry.isEnabled = enabled
+        entry.updatedAt = Date()
+
+        do {
+            try context.save()
+            loadEntries()
+        } catch {
+            entry.isEnabled = previousEnabled
+            entry.updatedAt = previousUpdatedAt
+            logger.error("Failed to set entry enabled state: \(error.localizedDescription)")
+        }
+    }
+
     /// Batch add multiple entries with a single save+reload
     func addEntries(_ items: [(type: DictionaryEntryType, original: String, replacement: String?, caseSensitive: Bool)]) {
+        addEntries(items.map {
+            (type: $0.type, original: $0.original, replacement: $0.replacement,
+             caseSensitive: $0.caseSensitive, ctcMinSimilarity: nil as Float?)
+        })
+    }
+
+    /// Batch add multiple entries with a single save+reload
+    func addEntries(_ items: [(type: DictionaryEntryType, original: String, replacement: String?, caseSensitive: Bool, ctcMinSimilarity: Float?)]) {
+        addEntries(items.map {
+            (type: $0.type, original: $0.original, replacement: $0.replacement,
+             caseSensitive: $0.caseSensitive, ctcMinSimilarity: $0.ctcMinSimilarity,
+             source: DictionaryEntrySource.manual)
+        })
+    }
+
+    /// Batch add multiple entries with a single save+reload
+    func addEntries(_ items: [(type: DictionaryEntryType, original: String, replacement: String?, caseSensitive: Bool, ctcMinSimilarity: Float?, source: DictionaryEntrySource)]) {
         guard let context = modelContext, !items.isEmpty else { return }
 
-        let existingOriginals = Set(entries.map { "\($0.type.rawValue):\($0.original.lowercased())" })
+        var existingOriginals = Set(entries.map { "\($0.type.rawValue):\($0.original.lowercased())" })
 
         for item in items {
             let key = "\(item.type.rawValue):\(item.original.lowercased())"
             guard !existingOriginals.contains(key) else { continue }
+            let now = Date()
 
             let entry = DictionaryEntry(
                 type: item.type,
                 original: item.original,
                 replacement: item.replacement,
                 caseSensitive: item.caseSensitive,
-                updatedAt: Date()
+                ctcMinSimilarity: Self.normalizedCtcMinSimilarity(item.type == .term ? item.ctcMinSimilarity : nil),
+                source: item.source,
+                createdAt: now,
+                updatedAt: now
             )
             context.insert(entry)
+            existingOriginals.insert(key)
         }
 
         do {
@@ -219,6 +266,23 @@ final class DictionaryService: ObservableObject {
 
     /// Import entries preserving all fields including isEnabled state
     func importEntries(_ items: [(type: DictionaryEntryType, original: String, replacement: String?, caseSensitive: Bool, isEnabled: Bool)]) {
+        importEntries(items.map {
+            (type: $0.type, original: $0.original, replacement: $0.replacement,
+             caseSensitive: $0.caseSensitive, isEnabled: $0.isEnabled, ctcMinSimilarity: nil as Float?)
+        })
+    }
+
+    /// Import entries preserving all fields including isEnabled state
+    func importEntries(_ items: [(type: DictionaryEntryType, original: String, replacement: String?, caseSensitive: Bool, isEnabled: Bool, ctcMinSimilarity: Float?)]) {
+        importEntries(items.map {
+            (type: $0.type, original: $0.original, replacement: $0.replacement,
+             caseSensitive: $0.caseSensitive, isEnabled: $0.isEnabled,
+             ctcMinSimilarity: $0.ctcMinSimilarity, source: DictionaryEntrySource.manual)
+        })
+    }
+
+    /// Import entries preserving all fields including isEnabled state
+    func importEntries(_ items: [(type: DictionaryEntryType, original: String, replacement: String?, caseSensitive: Bool, isEnabled: Bool, ctcMinSimilarity: Float?, source: DictionaryEntrySource)]) {
         guard let context = modelContext, !items.isEmpty else { return }
 
         var existingOriginals = Set(entries.map { "\($0.type.rawValue):\($0.original.lowercased())" })
@@ -226,6 +290,7 @@ final class DictionaryService: ObservableObject {
         for item in items {
             let key = "\(item.type.rawValue):\(item.original.lowercased())"
             guard !existingOriginals.contains(key) else { continue }
+            let now = Date()
 
             let entry = DictionaryEntry(
                 type: item.type,
@@ -233,7 +298,10 @@ final class DictionaryService: ObservableObject {
                 replacement: item.replacement,
                 caseSensitive: item.caseSensitive,
                 isEnabled: item.isEnabled,
-                updatedAt: Date()
+                ctcMinSimilarity: Self.normalizedCtcMinSimilarity(item.type == .term ? item.ctcMinSimilarity : nil),
+                source: item.source,
+                createdAt: now,
+                updatedAt: now
             )
             context.insert(entry)
             existingOriginals.insert(key)
@@ -267,6 +335,12 @@ final class DictionaryService: ObservableObject {
     /// Truncates at 600 characters to stay within the API's 224-token limit.
     func enabledTerms() -> [String] {
         PluginDictionaryTerms.normalizedTerms(from: terms.map(\.original))
+    }
+
+    func enabledTermHints() -> [PluginDictionaryTermHint] {
+        PluginDictionaryTerms.normalizedTermHints(from: terms.map {
+            PluginDictionaryTermHint(text: $0.original, ctcMinSimilarity: $0.ctcMinSimilarity)
+        })
     }
 
     func setTerms(_ rawTerms: [String], replaceExisting: Bool) {
@@ -315,6 +389,64 @@ final class DictionaryService: ObservableObject {
                 loadEntries()
             } catch {
                 logger.error("Failed to set terms: \(error.localizedDescription)")
+                throw DictionaryServiceMutationError.saveFailed(error)
+            }
+        }
+    }
+
+    func setAPITermEntries(_ rawTerms: [(term: String, ctcMinSimilarity: Float?)], replaceExisting: Bool) throws {
+        guard let context = modelContext else {
+            throw DictionaryServiceMutationError.unavailable
+        }
+
+        let normalized = PluginDictionaryTerms.normalizedTermHints(from: rawTerms.map {
+            PluginDictionaryTermHint(
+                text: $0.term,
+                ctcMinSimilarity: Self.normalizedCtcMinSimilarity($0.ctcMinSimilarity)
+            )
+        })
+        let normalizedByKey = Dictionary(uniqueKeysWithValues: normalized.map {
+            ($0.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current), $0)
+        })
+        let desiredKeys = Set(normalizedByKey.keys)
+        let existingTerms = entries.filter { $0.type == .term }
+
+        for entry in existingTerms {
+            let key = entry.original.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            if let desiredTerm = normalizedByKey[key] {
+                entry.original = desiredTerm.text
+                entry.isEnabled = true
+                entry.ctcMinSimilarity = desiredTerm.ctcMinSimilarity
+                entry.updatedAt = Date()
+            } else if replaceExisting {
+                context.delete(entry)
+            }
+        }
+
+        let existingKeys = Set(existingTerms.map {
+            $0.original.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        })
+
+        for term in normalized where !existingKeys.contains(term.text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)) {
+            let now = Date()
+            context.insert(DictionaryEntry(
+                type: .term,
+                original: term.text,
+                replacement: nil,
+                caseSensitive: false,
+                isEnabled: true,
+                ctcMinSimilarity: term.ctcMinSimilarity,
+                createdAt: now,
+                updatedAt: now
+            ))
+        }
+
+        if replaceExisting || !desiredKeys.isEmpty {
+            do {
+                try context.save()
+                loadEntries()
+            } catch {
+                logger.error("Failed to set term entries: \(error.localizedDescription)")
                 throw DictionaryServiceMutationError.saveFailed(error)
             }
         }
@@ -382,6 +514,22 @@ final class DictionaryService: ObservableObject {
         }
 
         return PluginDictionaryTerms.prompt(from: terms, budget: budget)
+    }
+
+    func getTermHints(providerId: String?) -> [PluginDictionaryTermHint] {
+        let hints = enabledTermHints()
+        guard !hints.isEmpty else { return [] }
+
+        guard let providerId,
+              let plugin = PluginManager.shared?.transcriptionEngine(for: providerId),
+              let budget = (plugin as? any DictionaryTermsBudgetProviding)?.dictionaryTermsBudget else {
+            return PluginDictionaryTerms.clippedTermHints(
+                from: hints,
+                budget: DictionaryTermsBudget(maxTotalChars: 600)
+            )
+        }
+
+        return PluginDictionaryTerms.clippedTermHints(from: hints, budget: budget)
     }
 
     /// Apply all enabled corrections to the given text
@@ -454,7 +602,8 @@ final class DictionaryService: ObservableObject {
         with replacement: String,
         caseSensitive: Bool
     ) -> String {
-        guard !original.isEmpty else { return text }
+        let boundaryOriginal = original.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !original.isEmpty, !boundaryOriginal.isEmpty else { return text }
 
         var result = ""
         var searchStart = text.startIndex
@@ -462,18 +611,100 @@ final class DictionaryService: ObservableObject {
 
         while let range = text.range(of: original, options: options, range: searchStart..<text.endIndex, locale: .current) {
             guard range.lowerBound < range.upperBound else { break }
+            let boundaryRange = boundaryEvaluationRange(for: range, in: text)
 
-            if isBoundaryMatch(range, in: text, original: original) {
-                result += text[searchStart..<range.lowerBound]
-                result += replacement
+            if boundaryRange.lowerBound < boundaryRange.upperBound,
+               isBoundaryMatch(boundaryRange, in: text, original: boundaryOriginal) {
+                let resolvedReplacement = boundaryReplacement(
+                    for: range,
+                    in: text,
+                    replacement: replacement,
+                    lowerLimit: searchStart
+                )
+                result += text[searchStart..<resolvedReplacement.range.lowerBound]
+                result += resolvedReplacement.text
+                searchStart = resolvedReplacement.range.upperBound
             } else {
                 result += text[searchStart..<range.upperBound]
+                searchStart = range.upperBound
             }
-            searchStart = range.upperBound
         }
 
         result += text[searchStart..<text.endIndex]
         return result
+    }
+
+    private func boundaryReplacement(
+        for range: Range<String.Index>,
+        in text: String,
+        replacement: String,
+        lowerLimit: String.Index
+    ) -> (range: Range<String.Index>, text: String) {
+        guard replacement.isEmpty else { return (range, replacement) }
+
+        let deletionRange = emptyBoundaryReplacementRange(for: range, in: text, lowerLimit: lowerLimit)
+        return (deletionRange, separatorAfterDeleting(deletionRange, in: text))
+    }
+
+    private func emptyBoundaryReplacementRange(
+        for range: Range<String.Index>,
+        in text: String,
+        lowerLimit: String.Index
+    ) -> Range<String.Index> {
+        var lowerBound = range.lowerBound
+        var upperBound = range.upperBound
+
+        if upperBound < text.endIndex, text[upperBound].isWhitespace {
+            while upperBound < text.endIndex, text[upperBound].isWhitespace {
+                upperBound = text.index(after: upperBound)
+            }
+        } else if shouldConsumeLeadingWhitespace(for: range, in: text) {
+            while lowerBound > lowerLimit {
+                let previous = text.index(before: lowerBound)
+                guard text[previous].isWhitespace else { break }
+                lowerBound = previous
+            }
+        }
+
+        return lowerBound..<upperBound
+    }
+
+    private func shouldConsumeLeadingWhitespace(for range: Range<String.Index>, in text: String) -> Bool {
+        guard range.lowerBound < range.upperBound else { return false }
+        let lastMatchedIndex = text.index(before: range.upperBound)
+        return !text[lastMatchedIndex].isWhitespace || range.upperBound == text.endIndex
+    }
+
+    private func separatorAfterDeleting(_ range: Range<String.Index>, in text: String) -> String {
+        let previous = range.lowerBound > text.startIndex ? text[text.index(before: range.lowerBound)] : nil
+        let next = range.upperBound < text.endIndex ? text[range.upperBound] : nil
+
+        if previous?.isLatinOrNumber == true && next?.isLatinOrNumber == true {
+            return " "
+        }
+
+        if previous?.keepsFollowingWordSeparatedAfterDeletion == true && next?.isLatinOrNumber == true {
+            return " "
+        }
+
+        return ""
+    }
+
+    private func boundaryEvaluationRange(for range: Range<String.Index>, in text: String) -> Range<String.Index> {
+        var lowerBound = range.lowerBound
+        var upperBound = range.upperBound
+
+        while lowerBound < upperBound, text[lowerBound].isWhitespace {
+            lowerBound = text.index(after: lowerBound)
+        }
+
+        while lowerBound < upperBound {
+            let previous = text.index(before: upperBound)
+            guard text[previous].isWhitespace else { break }
+            upperBound = previous
+        }
+
+        return lowerBound..<upperBound
     }
 
     private func isBoundaryMatch(_ range: Range<String.Index>, in text: String, original: String) -> Bool {
@@ -529,6 +760,7 @@ final class DictionaryService: ObservableObject {
                 original: original,
                 replacement: replacement,
                 caseSensitive: false,
+                source: .autoLearned,
                 createdAt: now,
                 updatedAt: now
             )
@@ -594,6 +826,7 @@ final class DictionaryService: ObservableObject {
             entry.replacement = replacement
             entry.caseSensitive = caseSensitive
             entry.isEnabled = true
+            entry.source = .manual
             entry.updatedAt = Date()
         } else {
             let now = Date()
@@ -603,6 +836,7 @@ final class DictionaryService: ObservableObject {
                 replacement: replacement,
                 caseSensitive: caseSensitive,
                 isEnabled: true,
+                source: .manual,
                 createdAt: now,
                 updatedAt: now
             )
@@ -661,6 +895,7 @@ final class DictionaryService: ObservableObject {
                 replacement: entry.type == .correction ? (entry.replacement ?? "") : nil,
                 caseSensitive: entry.caseSensitive,
                 isEnabled: entry.isEnabled,
+                source: entry.source == .manual ? nil : entry.source,
                 createdAt: entry.createdAt,
                 updatedAt: entry.effectiveUpdatedAt
             )
@@ -706,6 +941,7 @@ final class DictionaryService: ObservableObject {
             entry.replacement = replacement
             entry.caseSensitive = synced.caseSensitive
             entry.isEnabled = synced.isEnabled
+            entry.source = synced.source ?? .manual
             entry.updatedAt = synced.updatedAt
             return
         }
@@ -716,6 +952,7 @@ final class DictionaryService: ObservableObject {
             replacement: replacement,
             caseSensitive: synced.caseSensitive,
             isEnabled: synced.isEnabled,
+            source: synced.source ?? .manual,
             createdAt: synced.createdAt,
             updatedAt: synced.updatedAt
         ))
@@ -728,6 +965,11 @@ final class DictionaryService: ObservableObject {
             return
         }
         context.delete(entry)
+    }
+
+    private static func normalizedCtcMinSimilarity(_ value: Float?) -> Float? {
+        guard let value, value.isFinite else { return nil }
+        return Swift.min(Swift.max(value, 0), 1)
     }
 
 }
@@ -753,6 +995,15 @@ private extension Character {
             (0xF900...0xFAFF).contains(Int(scalar.value)) ||
             (0x20000...0x323AF).contains(Int(scalar.value)) ||
             (0xFF66...0xFF9D).contains(Int(scalar.value))
+        }
+    }
+
+    var keepsFollowingWordSeparatedAfterDeletion: Bool {
+        switch self {
+        case ",", ".", "!", "?", ";", ":":
+            return true
+        default:
+            return false
         }
     }
 

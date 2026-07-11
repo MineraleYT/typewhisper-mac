@@ -420,18 +420,10 @@ final class TextInsertionService {
               let currentState = captureFocusedTextState(for: element) else {
             return false
         }
-        return Self.focusedTextDidChange(
-            from: (
-                value: initialState.value,
-                selectedText: initialState.selectedText,
-                selectedRange: initialState.selectedRange
-            ),
-            to: (
-                value: currentState.value,
-                selectedText: currentState.selectedText,
-                selectedRange: currentState.selectedRange
-            )
-        )
+        guard let currentValue = currentState.value else {
+            return false
+        }
+        return initialState.value != currentValue
     }
 
     /// Saves all current clipboard contents for later restoration.
@@ -509,6 +501,17 @@ final class TextInsertionService {
             selectedText: state.selectedText,
             selectedRange: state.selectedRange
         )
+    }
+
+    enum FocusedTextElementMatch: Equatable {
+        case same
+        case different
+        case unavailable
+    }
+
+    func focusedTextElementMatch(_ observation: FocusedTextObservation) -> FocusedTextElementMatch {
+        guard let focusedElement = getFocusedTextElement() else { return .unavailable }
+        return focusedElement == observation.element ? .same : .different
     }
 
     func canRestoreClipboard(afterPasteUsing state: PasteVerificationState) -> Bool {

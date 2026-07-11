@@ -8,7 +8,7 @@ import TypeWhisperPluginSDK
 // MARK: - Plugin Entry Point
 
 @objc(Qwen3Plugin)
-final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModelCatalogProviding, DictionaryTermsCapabilityProviding, PluginSettingsActivityReporting, PluginDownloadedModelManaging, @unchecked Sendable {
+final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModelCatalogProviding, DictionaryTermsCapabilityProviding, PluginSettingsActivityReporting, PluginDownloadedModelManaging, PluginRuntimeMemoryDiagnosticsReporting, @unchecked Sendable {
     static let pluginId = "com.typewhisper.qwen3"
     static let pluginName = "Qwen3 ASR"
 
@@ -44,16 +44,18 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
     func activate(host: HostServices) {
         self.host = host
         _selectedModelId = host.userDefault(forKey: "selectedModel") as? String
-            ?? Self.availableModels.first?.id
         _hfToken = PluginHuggingFaceTokenHelper.loadToken(from: host)
 
-        Task { await restoreLoadedModel(allowDownloads: false) }
+        if shouldRestoreLoadedModelsPassively {
+            Task { await restoreLoadedModel(allowDownloads: false) }
+        }
     }
 
     func deactivate() {
         model = nil
         loadedModelId = nil
         modelState = .notLoaded
+        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
         host = nil
     }
 
@@ -64,6 +66,10 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
 
     var isConfigured: Bool {
         model != nil && loadedModelId != nil
+    }
+
+    var shouldRestoreLoadedModelsPassively: Bool {
+        host?.shouldRestoreLoadedModelsPassively ?? true
     }
 
     var transcriptionModels: [PluginModelInfo] {
@@ -103,7 +109,11 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
         guard let modelDef = Self.availableModels.first(where: { $0.id == modelId }) else { return }
 
         if loadedModelId == modelId {
-            unloadModel(clearPersistence: true)
+            model = nil
+            loadedModelId = nil
+            modelState = .notLoaded
+            host?.setUserDefault(nil, forKey: "loadedModel")
+            await Self.clearRuntimeCacheWhenInferenceIsIdle()
         }
         if _selectedModelId == modelId {
             _selectedModelId = nil
@@ -124,8 +134,25 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
     var selectedModelId: String? { _selectedModelId }
 
     func selectModel(_ modelId: String) {
+        let previousLoadedModelId = loadedModelId
+        let shouldClearLoadedModel = previousLoadedModelId != nil && previousLoadedModelId != modelId
         _selectedModelId = modelId
         host?.setUserDefault(modelId, forKey: "selectedModel")
+
+        if shouldClearLoadedModel {
+            model = nil
+            loadedModelId = nil
+            modelState = .notLoaded
+            host?.setUserDefault(nil, forKey: "loadedModel")
+            Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
+            host?.notifyCapabilitiesChanged()
+        }
+
+        guard shouldRestoreDownloadedSelection(modelId, previousLoadedModelId: previousLoadedModelId) else {
+            return
+        }
+
+        Task { await restoreLoadedModel(allowDownloads: false, preferredModelId: modelId) }
     }
 
     var supportsTranslation: Bool { false }
@@ -137,58 +164,61 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
         translate: Bool,
         prompt: String?
     ) async throws -> PluginTranscriptionResult {
-        guard let model else {
-            throw PluginTranscriptionError.notConfigured
-        }
+        try await PluginLocalInferenceGate.shared.withLock { [self] in
+            guard let model else {
+                throw PluginTranscriptionError.notConfigured
+            }
+            defer { Self.clearRuntimeCache() }
 
-        let audioArray = MLXArray(audio.samples)
-        let languageName = Self.resolveLanguageName(language)
-        let context = Self.contextBiasString(from: prompt)
+            let audioArray = MLXArray(audio.samples)
+            let languageName = Self.resolveLanguageName(language)
+            let context = Self.contextBiasString(from: prompt)
 
-        let primaryOutput = Self.generate(
-            model: model,
-            audio: audioArray,
-            params: Self.primaryParams,
-            context: context,
-            language: languageName
-        )
-        let primaryText = Self.normalizeTranscript(primaryOutput.text)
-        let text: String
-        let outputLanguageName: String?
-
-        if QwenTranscriptGuard.isLikelyLooped(primaryText) {
-            let fallbackOutput = Self.generate(
+            let primaryOutput = Self.generate(
                 model: model,
                 audio: audioArray,
-                params: Self.fallbackParams,
-                context: "",
+                params: Self.primaryParams,
+                context: context,
                 language: languageName
             )
-            let fallbackText = Self.normalizeTranscript(fallbackOutput.text)
+            let primaryText = Self.normalizeTranscript(primaryOutput.text)
+            let text: String
+            let outputLanguageName: String?
 
-            if fallbackText.isEmpty {
+            if QwenTranscriptGuard.isLikelyLooped(primaryText) {
+                let fallbackOutput = Self.generate(
+                    model: model,
+                    audio: audioArray,
+                    params: Self.fallbackParams,
+                    context: "",
+                    language: languageName
+                )
+                let fallbackText = Self.normalizeTranscript(fallbackOutput.text)
+
+                if fallbackText.isEmpty {
+                    text = primaryText
+                    outputLanguageName = primaryOutput.language
+                } else if QwenTranscriptGuard.isLikelyLooped(fallbackText) {
+                    text = QwenTranscriptGuard.preferredTranscript(primary: primaryText, fallback: fallbackText)
+                    outputLanguageName = primaryOutput.language ?? fallbackOutput.language
+                } else {
+                    text = fallbackText
+                    outputLanguageName = fallbackOutput.language
+                }
+            } else {
                 text = primaryText
                 outputLanguageName = primaryOutput.language
-            } else if QwenTranscriptGuard.isLikelyLooped(fallbackText) {
-                text = QwenTranscriptGuard.preferredTranscript(primary: primaryText, fallback: fallbackText)
-                outputLanguageName = primaryOutput.language ?? fallbackOutput.language
-            } else {
-                text = fallbackText
-                outputLanguageName = fallbackOutput.language
             }
-        } else {
-            text = primaryText
-            outputLanguageName = primaryOutput.language
+
+            let resultLanguageName = outputLanguageName ?? languageName
+            let cleanedText = QwenTranscriptGuard.removingLikelyTrailingArtifact(
+                from: text,
+                languageName: resultLanguageName
+            )
+            let detectedLanguage = Self.languageCode(forQwenLanguageName: resultLanguageName) ?? language
+
+            return PluginTranscriptionResult(text: cleanedText, detectedLanguage: detectedLanguage)
         }
-
-        let resultLanguageName = outputLanguageName ?? languageName
-        let cleanedText = QwenTranscriptGuard.removingLikelyTrailingArtifact(
-            from: text,
-            languageName: resultLanguageName
-        )
-        let detectedLanguage = Self.languageCode(forQwenLanguageName: resultLanguageName) ?? language
-
-        return PluginTranscriptionResult(text: cleanedText, detectedLanguage: detectedLanguage)
     }
 
     // MARK: - Model Management
@@ -218,12 +248,17 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
     }
 
     @objc func triggerAutoUnload() { unloadModel(clearPersistence: false) }
-    @objc func triggerRestoreModel() { Task { await restoreLoadedModel(allowDownloads: true) } }
+    @objc func triggerRestoreModel() { Task { await restoreLoadedModel(allowDownloads: false) } }
+    @objc(triggerRestoreModelForModel:) func triggerRestoreModel(forModel modelId: NSString?) {
+        let preferredModelId = modelId.map(String.init)
+        Task { await restoreLoadedModel(allowDownloads: false, preferredModelId: preferredModelId) }
+    }
 
     func unloadModel(clearPersistence: Bool = true) {
         model = nil
         loadedModelId = nil
         modelState = .notLoaded
+        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
         if clearPersistence {
             host?.setUserDefault(nil, forKey: "loadedModel")
         }
@@ -241,13 +276,68 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
         }
     }
 
-    func restoreLoadedModel(allowDownloads: Bool = true) async {
-        guard let savedId = host?.userDefault(forKey: "loadedModel") as? String,
-              let modelDef = Self.availableModels.first(where: { $0.id == savedId }) else {
-            return
+    func restoreLoadedModel(allowDownloads: Bool = false) async {
+        await restoreLoadedModel(allowDownloads: allowDownloads, preferredModelId: nil)
+    }
+
+    func restoreLoadedModel(allowDownloads: Bool = false, preferredModelId: String?) async {
+        for modelId in restoreCandidateModelIds(
+            preferredModelId: preferredModelId,
+            allowDownloads: allowDownloads
+        ) {
+            guard let modelDef = Self.availableModels.first(where: { $0.id == modelId }) else {
+                continue
+            }
+            do {
+                try await loadModel(modelDef)
+                return
+            } catch {
+                continue
+            }
         }
-        guard allowDownloads || hasDownloadedModel(modelDef) else { return }
-        try? await loadModel(modelDef)
+    }
+
+    func restoreCandidateModelIds(
+        preferredModelId: String? = nil,
+        allowDownloads: Bool = false
+    ) -> [String] {
+        var candidateIds: [String] = []
+
+        func appendCandidate(_ modelId: String?) {
+            guard let modelId, !modelId.isEmpty else { return }
+            guard Self.availableModels.contains(where: { $0.id == modelId }) else { return }
+            guard !candidateIds.contains(modelId) else { return }
+            candidateIds.append(modelId)
+        }
+
+        appendCandidate(preferredModelId)
+        appendCandidate(host?.userDefault(forKey: "loadedModel") as? String)
+        appendCandidate(_selectedModelId)
+
+        let downloadedIds = downloadedModels.map(\.id)
+        if downloadedIds.count == 1 {
+            appendCandidate(downloadedIds[0])
+        }
+
+        guard !allowDownloads else { return candidateIds }
+
+        return candidateIds.filter { modelId in
+            guard let modelDef = Self.availableModels.first(where: { $0.id == modelId }) else {
+                return false
+            }
+            return hasDownloadedModel(modelDef)
+        }
+    }
+
+    func shouldRestoreDownloadedSelection(
+        _ modelId: String,
+        previousLoadedModelId: String?
+    ) -> Bool {
+        guard previousLoadedModelId != modelId else { return false }
+        guard let modelDef = Self.availableModels.first(where: { $0.id == modelId }) else {
+            return false
+        }
+        return hasDownloadedModel(modelDef)
     }
 
     private func hasDownloadedModel(_ modelDef: Qwen3ModelDef) -> Bool {
@@ -272,6 +362,31 @@ final class Qwen3Plugin: NSObject, TranscriptionEnginePlugin, TranscriptionModel
             return PluginSettingsActivity(message: "Preparing model")
         case .error(let message):
             return PluginSettingsActivity(message: message, isError: true)
+        }
+    }
+
+    var runtimeMemorySnapshot: PluginRuntimeMemorySnapshot? {
+        let snapshot = Memory.snapshot()
+        return PluginRuntimeMemorySnapshot(
+            activeMemoryBytes: snapshot.activeMemory,
+            cacheMemoryBytes: snapshot.cacheMemory,
+            peakMemoryBytes: snapshot.peakMemory
+        )
+    }
+
+    private static func clearRuntimeCache() {
+        Memory.clearCache()
+    }
+
+    private static func clearRuntimeCacheWhenInferenceIsIdle() async {
+        try? await PluginLocalInferenceGate.shared.withLock {
+            Memory.clearCache()
+        }
+    }
+
+    private static func scheduleRuntimeCacheClearWhenInferenceIsIdle() {
+        Task {
+            await clearRuntimeCacheWhenInferenceIsIdle()
         }
     }
 
@@ -815,7 +930,7 @@ private struct Qwen3SettingsView: View {
         }
         .task {
             // Auto-restore previously loaded model
-            if case .notLoaded = plugin.modelState {
+            if case .notLoaded = plugin.modelState, plugin.shouldRestoreLoadedModelsPassively {
                 isPolling = true
                 await plugin.restoreLoadedModel(allowDownloads: false)
                 isPolling = false

@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
-import MLXVLM
+import MLX
+import MLXLLM
 import MLXLMCommon
 import HuggingFace
 import Hub
@@ -90,12 +91,17 @@ private struct Gemma4TokenizerLoader: TokenizerLoader {
 // MARK: - Plugin Entry Point
 
 @objc(Gemma4Plugin)
-final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllableProvider, LLMProviderSetupStatusProviding, LLMModelSelectable, PluginSettingsActivityReporting, PluginDownloadedModelManaging, @unchecked Sendable {
+final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllableProvider, LLMProviderSetupStatusProviding, LLMModelSelectable, PluginSettingsActivityReporting, PluginDownloadedModelManaging, PluginRuntimeMemoryDiagnosticsReporting, @unchecked Sendable {
     static let pluginId = "com.typewhisper.gemma4"
     static let pluginName = "Gemma 4"
     static let defaultGenerationTemperature = 0.1
     static let experimentalModelWarning = "Experimental. You can try it at your own risk."
     static let promptMaxTokens = 2048
+    private static let initialDownloadProgress = 0.0
+    private static let downloadedModelLoadProgress = 0.8
+    private static let loadedModelPreparationProgress = 0.9
+    private static let minimumVisibleDownloadProgress = 0.01
+    private static let minimumProgressAdvance = 0.001
 
     enum DownloadError: LocalizedError {
         case invalidRepositoryID(String)
@@ -115,6 +121,13 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     fileprivate var _generationTemperature: Double = 0.1
     fileprivate var _llmTemperatureModeRaw: String = PluginLLMTemperatureMode.custom.rawValue
     fileprivate var _hfToken: String?
+    private var modelLoadGeneration = 0
+    private var modelLoadTimeoutDuration: Duration = .seconds(300)
+    private let modelLoadClock = ContinuousClock()
+    private var lastModelLoadProgressInstant = ContinuousClock().now
+    private var lastModelLoadProgressFraction = 0.0
+    private var activeModelLoadTask: (generation: Int, task: Task<ModelContainer, Error>)?
+    private var restoreModelTask: Task<Void, Never>?
 
     private func modelsDirectory() -> URL {
         host?.pluginDataDirectory.appendingPathComponent("models")
@@ -123,6 +136,26 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
 
     private func localModelDirectory(for repoId: String) -> URL {
         modelsDirectory().appendingPathComponent(repoId, isDirectory: true)
+    }
+
+    private func hubCacheDirectory(for repoId: String) -> URL {
+        let cacheName = "models--" + repoId.replacingOccurrences(of: "/", with: "--")
+        return modelsDirectory().appendingPathComponent(cacheName, isDirectory: true)
+    }
+
+    private func hubLockDirectory(for repoId: String) -> URL {
+        let cacheName = "models--" + repoId.replacingOccurrences(of: "/", with: "--")
+        return modelsDirectory()
+            .appendingPathComponent(".locks", isDirectory: true)
+            .appendingPathComponent(cacheName, isDirectory: true)
+    }
+
+    private func modelCacheDirectories(for modelDef: Gemma4ModelDef) -> [URL] {
+        [
+            localModelDirectory(for: modelDef.repoId),
+            hubCacheDirectory(for: modelDef.repoId),
+            hubLockDirectory(for: modelDef.repoId),
+        ]
     }
     fileprivate var downloadProgress: Double = 0
 
@@ -141,9 +174,18 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             host.setUserDefault(sanitizedSelection, forKey: "selectedLLMModel")
         }
 
-        let persistedLoadedModel = host.userDefault(forKey: "loadedModel") as? String
-        if let persistedLoadedModel, !Self.canRestoreLoadedModel(persistedLoadedModel) {
-            host.setUserDefault(nil, forKey: "loadedModel")
+        let shouldAutoRestoreLoadedModel: Bool
+        if host.shouldRestoreLoadedModelsPassively,
+           let persistedLoadedModel = host.userDefault(forKey: "loadedModel") as? String {
+            if Self.canRestoreLoadedModel(persistedLoadedModel),
+               let modelDef = Self.modelDefinition(for: persistedLoadedModel) {
+                shouldAutoRestoreLoadedModel = isModelDownloaded(modelDef)
+            } else {
+                host.setUserDefault(nil, forKey: "loadedModel")
+                shouldAutoRestoreLoadedModel = false
+            }
+        } else {
+            shouldAutoRestoreLoadedModel = false
         }
 
         _generationTemperature = host.userDefault(forKey: "generationTemperature") as? Double
@@ -152,14 +194,23 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             ?? PluginLLMTemperatureMode.custom.rawValue
         _hfToken = PluginHuggingFaceTokenHelper.loadToken(from: host)
 
-        Task { await restoreLoadedModel(allowDownloads: false) }
+        restoreModelTask?.cancel()
+        if shouldAutoRestoreLoadedModel {
+            restoreModelTask = Task { [weak self] in
+                await self?.restoreLoadedModel(allowDownloads: false)
+            }
+        } else {
+            restoreModelTask = nil
+        }
     }
 
     func deactivate() {
+        invalidateModelLoad()
         modelContainer = nil
         loadedModelId = nil
         downloadProgress = 0
         modelState = .notLoaded
+        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
         host = nil
     }
 
@@ -171,6 +222,10 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         modelContainer != nil && loadedModelId != nil
     }
 
+    var shouldRestoreLoadedModelsPassively: Bool {
+        host?.shouldRestoreLoadedModelsPassively ?? true
+    }
+
     var supportedModels: [PluginModelInfo] {
         guard let loadedModelId else { return [] }
         return Self.availableModels
@@ -180,7 +235,7 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
 
     var downloadedModels: [PluginModelInfo] {
         Self.availableModels
-            .filter { hasDownloadedModel($0) }
+            .filter { isModelDownloaded($0) }
             .map { def in
                 PluginModelInfo(
                     id: def.id,
@@ -200,6 +255,7 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             loadedModelId = nil
             downloadProgress = 0
             modelState = .notLoaded
+            await Self.clearRuntimeCacheWhenInferenceIsIdle()
         }
         if _selectedLLMModelId == modelId {
             _selectedLLMModelId = nil
@@ -228,48 +284,52 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         model: String?,
         temperatureDirective: PluginLLMTemperatureDirective
     ) async throws -> String {
-        guard let modelContainer else {
-            throw PluginChatError.notConfigured
-        }
-
         let trimmedUserText = userText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedUserText.isEmpty else {
             throw Gemma4PluginError.noInputText
         }
 
-        let combinedPrompt = """
-        Follow these instructions exactly:
-        \(systemPrompt)
-
-        Input text:
-        \(trimmedUserText)
-        """
-
-        let chat: [Chat.Message] = [
-            .user(combinedPrompt),
-        ]
-        let userInput = UserInput(chat: chat)
-        let input = try await modelContainer.prepare(input: userInput)
         let resolvedTemperature = providerTemperatureDirective
             .resolvedTemperature(applying: temperatureDirective) ?? Self.defaultGenerationTemperature
 
-        let parameters = Self.promptGenerationParameters(
-            temperature: resolvedTemperature,
-            modelId: model ?? loadedModelId
-        )
-
-        let stream = try await modelContainer.generate(input: input, parameters: parameters)
-        var result = ""
-        for await generation in stream {
-            switch generation {
-            case .chunk(let text):
-                result += text
-            case .info, .toolCall:
-                break
+        return try await PluginLocalInferenceGate.shared.withLock { [self] in
+            guard let modelContainer else {
+                throw PluginChatError.notConfigured
             }
-        }
+            defer { Self.clearRuntimeCache() }
 
-        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+            let combinedPrompt = """
+            Follow these instructions exactly:
+            \(systemPrompt)
+
+            Input text:
+            \(trimmedUserText)
+            """
+
+            let chat: [Chat.Message] = [
+                .user(combinedPrompt),
+            ]
+            let userInput = UserInput(chat: chat)
+            let input = try await modelContainer.prepare(input: userInput)
+
+            let parameters = Self.promptGenerationParameters(
+                temperature: resolvedTemperature,
+                modelId: model ?? loadedModelId
+            )
+
+            let stream = try await modelContainer.generate(input: input, parameters: parameters)
+            var result = ""
+            for await generation in stream {
+                switch generation {
+                case .chunk(let text):
+                    result += text
+                case .info, .toolCall:
+                    break
+                }
+            }
+
+            return result.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     // MARK: - LLMModelSelectable
@@ -284,6 +344,7 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     var preferredModelId: String? { _selectedLLMModelId }
     var huggingFaceToken: String? { _hfToken }
     var currentDownloadProgress: Double { downloadProgress }
+    var hasVisibleDownloadProgress: Bool { downloadProgress >= Self.minimumVisibleDownloadProgress }
 
     var generationTemperature: Double { _generationTemperature }
     var llmTemperatureMode: PluginLLMTemperatureMode {
@@ -312,6 +373,15 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         return String(
             localized: "Load a Gemma 4 model in Integrations before using it for prompts.",
             bundle: bundle
+        )
+    }
+
+    var runtimeMemorySnapshot: PluginRuntimeMemorySnapshot? {
+        let snapshot = Memory.snapshot()
+        return PluginRuntimeMemorySnapshot(
+            activeMemoryBytes: snapshot.activeMemory,
+            cacheMemoryBytes: snapshot.cacheMemory,
+            peakMemoryBytes: snapshot.peakMemory
         )
     }
 
@@ -350,17 +420,29 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     }
 
     func isModelDownloaded(_ modelDef: Gemma4ModelDef) -> Bool {
-        hasDownloadedModel(modelDef)
+        isUsableDownloadedModel(modelDef)
     }
 
-    func beginModelLoad(for modelDef: Gemma4ModelDef, isAlreadyDownloaded: Bool) {
+    func hasCachedModelFiles(_ modelDef: Gemma4ModelDef) -> Bool {
+        modelCacheDirectories(for: modelDef).contains { cacheDir in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: cacheDir.path, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        }
+    }
+
+    @discardableResult
+    func beginModelLoad(for modelDef: Gemma4ModelDef, isAlreadyDownloaded: Bool) -> Int {
+        let generation = beginModelLoad()
         _selectedLLMModelId = modelDef.id
         modelState = isAlreadyDownloaded ? .loading : .downloading
-        downloadProgress = isAlreadyDownloaded ? 0.8 : 0.02
+        downloadProgress = isAlreadyDownloaded ? Self.downloadedModelLoadProgress : Self.initialDownloadProgress
         host?.notifyCapabilitiesChanged()
+        return generation
     }
 
     func cancelModelLoad() {
+        invalidateModelLoad()
         downloadProgress = 0
         modelState = .notLoaded
         host?.notifyCapabilitiesChanged()
@@ -370,12 +452,16 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
 
     func loadModel(_ modelDef: Gemma4ModelDef) async throws {
         try Task.checkCancellation()
-        let isAlreadyDownloaded = hasDownloadedModel(modelDef)
-        beginModelLoad(for: modelDef, isAlreadyDownloaded: isAlreadyDownloaded)
+        let isAlreadyDownloaded = isModelDownloaded(modelDef)
+        let loadGeneration = beginModelLoad(for: modelDef, isAlreadyDownloaded: isAlreadyDownloaded)
+        startModelLoadTimeout(generation: loadGeneration, modelName: modelDef.displayName)
         do {
             let token = _hfToken?.trimmingCharacters(in: .whitespacesAndNewlines)
             let modelsDir = modelsDirectory()
             try? FileManager.default.createDirectory(at: modelsDir, withIntermediateDirectories: true)
+            if !isAlreadyDownloaded {
+                removeIncompleteModelIfNeeded(modelDef)
+            }
 
             let hubClient = HubClient(
                 host: HubClient.defaultHost,
@@ -383,29 +469,47 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
                 cache: HubCache(cacheDirectory: modelsDir)
             )
             let downloader = Gemma4HubDownloader(client: hubClient, modelsDirectory: modelsDir)
-            let configuration = ModelConfiguration(
-                id: modelDef.repoId,
-                extraEOSTokens: ["<turn|>"]
-            )
-            let container = try await VLMModelFactory.shared.loadContainer(
-                from: downloader,
-                using: Gemma4TokenizerLoader(),
-                configuration: configuration
-            ) { progress in
-                guard !Task.isCancelled else { return }
-                let fraction = max(0.0, min(progress.fractionCompleted, 1.0))
-                let mapped = 0.02 + fraction * 0.78
-                Task { @MainActor in
-                    self.downloadProgress = mapped
-                    if case .downloading = self.modelState {
-                        self.host?.notifyCapabilitiesChanged()
+            let configuration = isAlreadyDownloaded
+                ? ModelConfiguration(
+                    directory: localModelDirectory(for: modelDef.repoId),
+                    extraEOSTokens: ["<turn|>"]
+                )
+                : ModelConfiguration(
+                    id: modelDef.repoId,
+                    extraEOSTokens: ["<turn|>"]
+                )
+            let loadTask = Task<ModelContainer, Error> {
+                try await LLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: Gemma4TokenizerLoader(),
+                    configuration: configuration
+                ) { progress in
+                    guard !Task.isCancelled else { return }
+                    let fraction = max(0.0, min(progress.fractionCompleted, 1.0))
+                    let mapped = Self.initialDownloadProgress + fraction * 0.78
+                    Task { @MainActor in
+                        guard self.recordModelLoadProgress(fraction: fraction, generation: loadGeneration) else {
+                            return
+                        }
+                        self.downloadProgress = max(self.downloadProgress, mapped)
+                        if case .downloading = self.modelState {
+                            self.host?.notifyCapabilitiesChanged()
+                        }
                     }
                 }
             }
+            activeModelLoadTask = (generation: loadGeneration, task: loadTask)
+            defer {
+                if activeModelLoadTask?.generation == loadGeneration {
+                    activeModelLoadTask = nil
+                }
+            }
+            let container = try await loadTask.value
 
             try Task.checkCancellation()
+            guard isCurrentModelLoad(loadGeneration) else { return }
             modelState = .loading
-            downloadProgress = 0.9
+            downloadProgress = Self.loadedModelPreparationProgress
             modelContainer = container
             loadedModelId = modelDef.id
             _selectedLLMModelId = modelDef.id
@@ -416,11 +520,18 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             host?.notifyCapabilitiesChanged()
         } catch {
             if error is CancellationError {
-                cancelModelLoad()
+                if isCurrentModelLoad(loadGeneration) {
+                    cancelModelLoad()
+                }
                 throw error
             }
+            guard isCurrentModelLoad(loadGeneration) else { return }
+            modelContainer = nil
+            loadedModelId = nil
             downloadProgress = 0
             modelState = .error(Self.userFacingLoadErrorMessage(for: error, modelDef: modelDef))
+            host?.setUserDefault(nil, forKey: "loadedModel")
+            host?.notifyCapabilitiesChanged()
             throw error
         }
     }
@@ -429,10 +540,12 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     @objc func triggerRestoreModel() { Task { await restoreLoadedModel(allowDownloads: true) } }
 
     func unloadModel(clearPersistence: Bool = true) {
+        invalidateModelLoad()
         modelContainer = nil
         loadedModelId = nil
         downloadProgress = 0
         modelState = .notLoaded
+        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
         if clearPersistence {
             host?.setUserDefault(nil, forKey: "loadedModel")
         }
@@ -440,20 +553,45 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     }
 
     func deleteModelFiles(_ modelDef: Gemma4ModelDef) throws {
-        let repoDir = localModelDirectory(for: modelDef.repoId)
-        if FileManager.default.fileExists(atPath: repoDir.path) {
-            try FileManager.default.removeItem(at: repoDir)
+        let fileManager = FileManager.default
+        for cacheDir in modelCacheDirectories(for: modelDef) {
+            if fileManager.fileExists(atPath: cacheDir.path) {
+                try fileManager.removeItem(at: cacheDir)
+            }
+        }
+
+        let repoNamespaceDir = localModelDirectory(for: modelDef.repoId).deletingLastPathComponent()
+        if (try? fileManager.contentsOfDirectory(atPath: repoNamespaceDir.path).isEmpty) == true {
+            try? fileManager.removeItem(at: repoNamespaceDir)
         }
     }
 
     func resetCachedModel(_ modelDef: Gemma4ModelDef) {
+        invalidateModelLoad()
         modelContainer = nil
         loadedModelId = nil
         downloadProgress = 0
         modelState = .notLoaded
+        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
         host?.setUserDefault(nil, forKey: "loadedModel")
         try? deleteModelFiles(modelDef)
         host?.notifyCapabilitiesChanged()
+    }
+
+    private static func clearRuntimeCache() {
+        Memory.clearCache()
+    }
+
+    private static func clearRuntimeCacheWhenInferenceIsIdle() async {
+        try? await PluginLocalInferenceGate.shared.withLock {
+            Memory.clearCache()
+        }
+    }
+
+    private static func scheduleRuntimeCacheClearWhenInferenceIsIdle() {
+        Task {
+            await clearRuntimeCacheWhenInferenceIsIdle()
+        }
     }
 
     func restoreLoadedModel(allowDownloads: Bool = true) async {
@@ -462,17 +600,148 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             host?.setUserDefault(nil, forKey: "loadedModel")
             return
         }
-        guard allowDownloads || hasDownloadedModel(modelDef) else { return }
+        guard allowDownloads || isModelDownloaded(modelDef) else {
+            host?.setUserDefault(nil, forKey: "loadedModel")
+            return
+        }
         try? await loadModel(modelDef)
     }
 
-    private func hasDownloadedModel(_ modelDef: Gemma4ModelDef) -> Bool {
-        let repoDir = localModelDirectory(for: modelDef.repoId)
-
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: repoDir.path, isDirectory: &isDirectory)
-            && isDirectory.boolValue
+    @discardableResult
+    private func beginModelLoad() -> Int {
+        modelLoadGeneration += 1
+        lastModelLoadProgressInstant = modelLoadClock.now
+        lastModelLoadProgressFraction = 0
+        return modelLoadGeneration
     }
+
+    private func invalidateModelLoad() {
+        modelLoadGeneration += 1
+        restoreModelTask?.cancel()
+        restoreModelTask = nil
+        activeModelLoadTask?.task.cancel()
+        activeModelLoadTask = nil
+    }
+
+    private func isCurrentModelLoad(_ generation: Int) -> Bool {
+        generation == modelLoadGeneration
+    }
+
+    private func recordModelLoadProgress(fraction: Double, generation: Int) -> Bool {
+        guard isCurrentModelLoad(generation) else { return false }
+        let normalized = max(0.0, min(fraction, 1.0))
+        guard normalized - lastModelLoadProgressFraction >= Self.minimumProgressAdvance else {
+            return false
+        }
+        lastModelLoadProgressFraction = normalized
+        lastModelLoadProgressInstant = modelLoadClock.now
+        return true
+    }
+
+    private func startModelLoadTimeout(generation: Int, modelName: String) {
+        let timeout = modelLoadTimeoutDuration
+        Task { [weak self] in
+            while true {
+                guard let self,
+                      self.isCurrentModelLoad(generation),
+                      self.loadedModelId == nil else {
+                    return
+                }
+
+                switch self.modelState {
+                case .downloading, .loading:
+                    break
+                default:
+                    return
+                }
+
+                let elapsed = self.lastModelLoadProgressInstant.duration(to: self.modelLoadClock.now)
+                guard elapsed >= timeout else {
+                    try? await Task.sleep(for: timeout - elapsed)
+                    continue
+                }
+
+                self.invalidateModelLoad()
+                self.modelContainer = nil
+                self.loadedModelId = nil
+                self.downloadProgress = 0
+                self.modelState = .error(Self.stalledDownloadMessage(for: modelName))
+                self.host?.setUserDefault(nil, forKey: "loadedModel")
+                self.host?.notifyCapabilitiesChanged()
+                return
+            }
+        }
+    }
+
+    private func isUsableDownloadedModel(_ modelDef: Gemma4ModelDef) -> Bool {
+        let repoDir = localModelDirectory(for: modelDef.repoId)
+        return Self.isUsableDownloadedModel(at: repoDir)
+    }
+
+    static func isUsableDownloadedModel(at repoDir: URL) -> Bool {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: repoDir.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return false
+        }
+
+        let requiredRootFiles = [
+            "config.json",
+            "tokenizer.json",
+        ]
+        guard requiredRootFiles.allSatisfy({ fileManager.fileExists(atPath: repoDir.appendingPathComponent($0).path) }) else {
+            return false
+        }
+
+        guard let enumerator = fileManager.enumerator(
+            at: repoDir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "safetensors" {
+            return true
+        }
+        return false
+    }
+
+    private func removeIncompleteModelIfNeeded(_ modelDef: Gemma4ModelDef) {
+        let repoDir = localModelDirectory(for: modelDef.repoId)
+        guard hasCachedModelFiles(modelDef), !Self.isUsableDownloadedModel(at: repoDir) else { return }
+        try? deleteModelFiles(modelDef)
+    }
+
+    #if DEBUG
+    func setModelLoadTimeoutForTesting(_ timeout: Duration) {
+        modelLoadTimeoutDuration = timeout
+    }
+
+    @discardableResult
+    func startModelLoadTimeoutForTesting(modelName: String) -> Int {
+        let generation = beginModelLoad()
+        modelState = .downloading
+        downloadProgress = Self.initialDownloadProgress
+        startModelLoadTimeout(generation: generation, modelName: modelName)
+        return generation
+    }
+
+    func recordModelLoadProgressForTesting(fraction: Double, generation: Int? = nil) {
+        let resolvedGeneration = generation ?? modelLoadGeneration
+        guard recordModelLoadProgress(fraction: fraction, generation: resolvedGeneration) else { return }
+        downloadProgress = Self.initialDownloadProgress + max(0.0, min(fraction, 1.0)) * 0.78
+    }
+
+    func invalidateModelLoadForTesting() {
+        invalidateModelLoad()
+    }
+
+    func isCurrentModelLoadForTesting(_ generation: Int) -> Bool {
+        isCurrentModelLoad(generation)
+    }
+    #endif
 
     // MARK: - Settings Activity
 
@@ -483,7 +752,7 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         case .downloading:
             return PluginSettingsActivity(
                 message: "Downloading model",
-                progress: downloadProgress
+                progress: hasVisibleDownloadProgress ? downloadProgress : nil
             )
         case .loading:
             return PluginSettingsActivity(message: "Preparing model")
@@ -570,7 +839,7 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             )
         }
 
-        let rawMessage = String(describing: error).lowercased()
+        let rawMessage = "\(String(describing: error))\n\(error.localizedDescription)".lowercased()
         if isRecoverableCacheError(rawMessage) {
             let bundle = Bundle(for: Gemma4Plugin.self)
             return String(
@@ -587,12 +856,22 @@ final class Gemma4Plugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         return error.localizedDescription
     }
 
+    private static func stalledDownloadMessage(for modelName: String) -> String {
+        let bundle = Bundle(for: Gemma4Plugin.self)
+        let format = String(
+            localized: "Downloading or preparing %@ has not made progress for several minutes. Cancel, delete the cached model if one is shown, and try again. Adding an optional HuggingFace token may also help if Hugging Face is throttling downloads.",
+            bundle: bundle
+        )
+        return String(format: format, modelName)
+    }
+
     private static func isRecoverableCacheError(_ rawMessage: String) -> Bool {
         (rawMessage.contains("key ") && rawMessage.contains(" not found"))
             || rawMessage.contains("missing key")
             || rawMessage.contains("missing weight")
             || rawMessage.contains("shape mismatch")
             || rawMessage.contains("size mismatch")
+            || (rawMessage.contains("mismatched parameter") && rawMessage.contains("shape"))
             || (rawMessage.contains("checkpoint")
                 && (rawMessage.contains("not found")
                     || rawMessage.contains("missing")

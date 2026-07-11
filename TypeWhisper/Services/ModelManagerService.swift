@@ -36,6 +36,48 @@ extension TranscriptionEnginePlugin {
     }
 }
 
+enum ModelAutoUnloadPolicy {
+    static let defaultSeconds = 600
+
+    static func effectiveSeconds(defaults: UserDefaults = .standard) -> Int {
+        guard defaults.object(forKey: UserDefaultsKeys.modelAutoUnloadSeconds) != nil else {
+            return defaultSeconds
+        }
+        return defaults.integer(forKey: UserDefaultsKeys.modelAutoUnloadSeconds)
+    }
+
+    static func shouldRestoreLoadedModelsPassively(defaults: UserDefaults = .standard) -> Bool {
+        effectiveSeconds(defaults: defaults) == 0
+    }
+
+    static func policyName(seconds: Int) -> String {
+        switch seconds {
+        case 0:
+            return "never"
+        case -1:
+            return "immediate"
+        default:
+            return "afterSeconds"
+        }
+    }
+}
+
+struct ModelAutoUnloadDiagnosticsSnapshot: Encodable, Equatable, Sendable {
+    struct Entry: Encodable, Equatable, Sendable {
+        let pluginClassName: String
+        let pluginObjectIdentifier: String
+        let policySeconds: Int
+        let scheduledAt: Date?
+        let dueAt: Date?
+        let lastFiredAt: Date?
+        let lastSelectorResponded: Bool?
+    }
+
+    let policySeconds: Int
+    let policyName: String
+    let entries: [Entry]
+}
+
 @MainActor
 final class ModelManagerService: ObservableObject {
     struct LiveTranscriptionSessionHandle: Sendable {
@@ -53,6 +95,18 @@ final class ModelManagerService: ObservableObject {
         }
     }
 
+    private enum PluginRestoreResult {
+        case unavailable
+        case configured
+        case failed(String)
+    }
+
+    private enum PluginRestoreWaitResult {
+        case configured
+        case failed(String)
+        case timedOut(activity: PluginSettingsActivity?)
+    }
+
     @Published private(set) var selectedProviderId: String?
 
     @Published var autoUnloadSeconds: Int {
@@ -65,15 +119,32 @@ final class ModelManagerService: ObservableObject {
 
     private var autoUnloadTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
     private var autoUnloadTargets: [ObjectIdentifier: AutoUnloadTarget] = [:]
+    private var autoUnloadDiagnostics: [ObjectIdentifier: ModelAutoUnloadDiagnosticsSnapshot.Entry] = [:]
+    private var autoUnloadUsageCounts: [ObjectIdentifier: Int] = [:]
     private var cancellables = Set<AnyCancellable>()
+    private var pluginConfiguredWaitAttempts = 300
+    private var pluginRestoreBusyWaitAttempts = 5_700
+    private var pluginConfiguredPollInterval: Duration = .milliseconds(100)
 
     private let providerKey = UserDefaultsKeys.selectedEngine
     private let modelKey = UserDefaultsKeys.selectedModelId
 
     init() {
-        self.autoUnloadSeconds = UserDefaults.standard.integer(forKey: UserDefaultsKeys.modelAutoUnloadSeconds)
+        self.autoUnloadSeconds = ModelAutoUnloadPolicy.effectiveSeconds()
         self.selectedProviderId = UserDefaults.standard.string(forKey: providerKey)
     }
+
+    #if DEBUG
+    func setPluginRestoreWaitConfigurationForTesting(
+        initialAttempts: Int,
+        busyAttempts: Int,
+        pollInterval: Duration
+    ) {
+        pluginConfiguredWaitAttempts = max(0, initialAttempts)
+        pluginRestoreBusyWaitAttempts = max(0, busyAttempts)
+        pluginConfiguredPollInterval = pollInterval
+    }
+    #endif
 
     // MARK: - Public API
 
@@ -157,6 +228,7 @@ final class ModelManagerService: ObservableObject {
             .sink { [weak self] _ in
                 guard let self else { return }
                 self.restoreProviderSelection()
+                self.scheduleAutoUnloadIfNeeded()
                 self.objectWillChange.send()
             }
             .store(in: &cancellables)
@@ -278,13 +350,14 @@ final class ModelManagerService: ObservableObject {
     ) -> String? {
         guard let override else { return nil }
         let previousId = plugin.selectedModelId
+        if previousId != override || !plugin.isConfigured {
+            plugin.selectModel(override)
+        }
         // If the plugin had no previous selection we can't express "unselect" through the SDK,
         // so the override stays in place. For configured plugins selectedModelId is normally set.
         guard let previousId, previousId != override else {
-            if previousId != override { plugin.selectModel(override) }
             return nil
         }
-        plugin.selectModel(override)
         return previousId
     }
 
@@ -319,6 +392,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         onProgress: @Sendable @escaping (String) -> Bool
     ) async throws -> LiveTranscriptionSessionHandle? {
         try await createLiveTranscriptionSession(
@@ -327,6 +401,7 @@ final class ModelManagerService: ObservableObject {
             engineOverrideId: engineOverrideId,
             cloudModelOverride: cloudModelOverride,
             prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
             onProgress: onProgress
         )
     }
@@ -337,6 +412,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         onProgress: @Sendable @escaping (String) -> Bool
     ) async throws -> LiveTranscriptionSessionHandle? {
         let providerId = engineOverrideId ?? selectedProviderId
@@ -377,11 +453,30 @@ final class ModelManagerService: ObservableObject {
         let session: any LiveTranscriptionSession
         do {
             if !runtimeSelection.languageHints.isEmpty,
+               !dictionaryTermHints.isEmpty,
+               let hintTermPlugin = livePlugin as? LiveLanguageHintDictionaryTermHintTranscriptionCapablePlugin {
+                session = try await hintTermPlugin.createLiveTranscriptionSession(
+                    languageSelection: runtimeSelection,
+                    translate: task == .translate,
+                    prompt: prompt,
+                    dictionaryTermHints: dictionaryTermHints,
+                    onProgress: onProgress
+                )
+            } else if !runtimeSelection.languageHints.isEmpty,
                let hintPlugin = livePlugin as? LiveLanguageHintTranscriptionCapablePlugin {
                 session = try await hintPlugin.createLiveTranscriptionSession(
                     languageSelection: runtimeSelection,
                     translate: task == .translate,
                     prompt: prompt,
+                    onProgress: onProgress
+                )
+            } else if !dictionaryTermHints.isEmpty,
+                      let termHintPlugin = livePlugin as? LiveDictionaryTermHintTranscriptionCapablePlugin {
+                session = try await termHintPlugin.createLiveTranscriptionSession(
+                    language: runtimeSelection.requestedLanguage,
+                    translate: task == .translate,
+                    prompt: prompt,
+                    dictionaryTermHints: dictionaryTermHints,
                     onProgress: onProgress
                 )
             } else {
@@ -447,6 +542,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         normalizeNumbers: Bool? = nil
     ) async throws -> TranscriptionResult {
         try await transcribe(
@@ -456,6 +552,7 @@ final class ModelManagerService: ObservableObject {
             engineOverrideId: engineOverrideId,
             cloudModelOverride: cloudModelOverride,
             prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
             normalizeNumbers: normalizeNumbers
         )
     }
@@ -467,6 +564,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         normalizeNumbers: Bool? = nil
     ) async throws -> TranscriptionResult {
         let providerId = engineOverrideId ?? selectedProviderId
@@ -511,7 +609,8 @@ final class ModelManagerService: ObservableObject {
             audio: audio,
             languageSelection: runtimeSelection,
             task: task,
-            prompt: prompt
+            prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints
         )
 
         let processingTime = CFAbsoluteTimeGetCurrent() - startTime
@@ -539,6 +638,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         normalizeNumbers: Bool? = nil,
         onProgress: @Sendable @escaping (String) -> Bool
     ) async throws -> TranscriptionResult {
@@ -549,6 +649,7 @@ final class ModelManagerService: ObservableObject {
             engineOverrideId: engineOverrideId,
             cloudModelOverride: cloudModelOverride,
             prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
             normalizeNumbers: normalizeNumbers,
             onProgress: onProgress,
             onSourceProgress: { _ in true }
@@ -562,6 +663,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         normalizeNumbers: Bool? = nil,
         onProgress: @Sendable @escaping (String) -> Bool
     ) async throws -> TranscriptionResult {
@@ -572,6 +674,7 @@ final class ModelManagerService: ObservableObject {
             engineOverrideId: engineOverrideId,
             cloudModelOverride: cloudModelOverride,
             prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
             normalizeNumbers: normalizeNumbers,
             onProgress: onProgress,
             onSourceProgress: { _ in true }
@@ -585,6 +688,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         normalizeNumbers: Bool? = nil,
         onProgress: @Sendable @escaping (String) -> Bool,
         onSourceProgress: @Sendable @escaping (PluginTranscriptionSourceProgress) -> Bool
@@ -596,6 +700,7 @@ final class ModelManagerService: ObservableObject {
             engineOverrideId: engineOverrideId,
             cloudModelOverride: cloudModelOverride,
             prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
             normalizeNumbers: normalizeNumbers,
             onProgress: onProgress,
             onSourceProgress: onSourceProgress
@@ -609,6 +714,7 @@ final class ModelManagerService: ObservableObject {
         engineOverrideId: String? = nil,
         cloudModelOverride: String? = nil,
         prompt: String? = nil,
+        dictionaryTermHints: [PluginDictionaryTermHint] = [],
         normalizeNumbers: Bool? = nil,
         onProgress: @Sendable @escaping (String) -> Bool,
         onSourceProgress: @Sendable @escaping (PluginTranscriptionSourceProgress) -> Bool
@@ -656,6 +762,7 @@ final class ModelManagerService: ObservableObject {
             languageSelection: runtimeSelection,
             task: task,
             prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
             onProgress: onProgress,
             onSourceProgress: onSourceProgress
         )
@@ -681,24 +788,97 @@ final class ModelManagerService: ObservableObject {
     // MARK: - Auto-Unload
 
     func scheduleAutoUnloadIfNeeded() {
-        guard let providerId = selectedProviderId,
-              let plugin = PluginManager.shared.transcriptionEngine(for: providerId),
-              plugin.isConfigured else { return }
+        var scheduledKeys = Set<ObjectIdentifier>()
 
-        scheduleAutoUnloadIfNeeded(for: plugin)
+        for plugin in PluginManager.shared.transcriptionEngines where plugin.isConfigured {
+            scheduleAutoUnloadIfNeeded(for: plugin, scheduledKeys: &scheduledKeys)
+        }
+
+        for plugin in PluginManager.shared.llmProviders
+            where plugin.isAvailable && Self.shouldAutoUnloadLocalLLMProvider(plugin) {
+            scheduleAutoUnloadIfNeeded(for: plugin, scheduledKeys: &scheduledKeys)
+        }
+
+        let existingKeys = Set(autoUnloadTasks.keys)
+            .union(autoUnloadTargets.keys)
+            .union(autoUnloadDiagnostics.keys)
+        for key in existingKeys.subtracting(scheduledKeys) {
+            autoUnloadTasks[key]?.cancel()
+            autoUnloadTasks[key] = nil
+            autoUnloadTargets[key] = nil
+            autoUnloadDiagnostics[key] = nil
+        }
     }
 
     func scheduleAutoUnloadIfNeeded(for plugin: any TypeWhisperPlugin) {
         guard let nsPlugin = plugin as? NSObject else { return }
-        let key = ObjectIdentifier(nsPlugin)
+        var scheduledKeys = Set<ObjectIdentifier>()
+        scheduleAutoUnloadIfNeeded(for: nsPlugin, scheduledKeys: &scheduledKeys)
+    }
 
-        autoUnloadTasks[key]?.cancel()
-        autoUnloadTasks[key] = nil
-        autoUnloadTargets[key] = nil
+    func beginAutoUnloadProtectedUse(of plugin: any TypeWhisperPlugin) {
+        guard let nsPlugin = plugin as? NSObject else { return }
+        let key = ObjectIdentifier(nsPlugin)
+        autoUnloadUsageCounts[key, default: 0] += 1
+        clearAutoUnloadSchedule(for: key)
+    }
+
+    func endAutoUnloadProtectedUse(of plugin: any TypeWhisperPlugin) {
+        guard let nsPlugin = plugin as? NSObject else { return }
+        let key = ObjectIdentifier(nsPlugin)
+        guard let currentUses = autoUnloadUsageCounts[key], currentUses > 0 else { return }
+        let remainingUses = currentUses - 1
+        if remainingUses > 0 {
+            autoUnloadUsageCounts[key] = remainingUses
+            return
+        }
+
+        autoUnloadUsageCounts[key] = nil
+        var scheduledKeys = Set<ObjectIdentifier>()
+        scheduleAutoUnloadIfNeeded(for: nsPlugin, scheduledKeys: &scheduledKeys)
+    }
+
+    private static func shouldAutoUnloadLocalLLMProvider(_ plugin: any LLMProviderPlugin) -> Bool {
+        guard let setupStatus = plugin as? any LLMProviderSetupStatusProviding else {
+            return false
+        }
+        return !setupStatus.requiresExternalCredentials
+    }
+
+    private func scheduleAutoUnloadIfNeeded(
+        for plugin: any TypeWhisperPlugin,
+        scheduledKeys: inout Set<ObjectIdentifier>
+    ) {
+        guard let nsPlugin = plugin as? NSObject else { return }
+        scheduleAutoUnloadIfNeeded(for: nsPlugin, scheduledKeys: &scheduledKeys)
+    }
+
+    private func scheduleAutoUnloadIfNeeded(
+        for nsPlugin: NSObject,
+        scheduledKeys: inout Set<ObjectIdentifier>
+    ) {
+        let key = ObjectIdentifier(nsPlugin)
+        guard scheduledKeys.insert(key).inserted else { return }
+
+        clearAutoUnloadSchedule(for: key)
+        guard autoUnloadUsageCounts[key] == nil else { return }
 
         let seconds = autoUnloadSeconds
         guard seconds != 0 else { return }
 
+        let scheduledAt = Date()
+        let dueAt = seconds == -1
+            ? scheduledAt.addingTimeInterval(0.1)
+            : scheduledAt.addingTimeInterval(TimeInterval(seconds))
+        autoUnloadDiagnostics[key] = ModelAutoUnloadDiagnosticsSnapshot.Entry(
+            pluginClassName: String(describing: type(of: nsPlugin)),
+            pluginObjectIdentifier: Self.diagnosticIdentifier(for: key),
+            policySeconds: seconds,
+            scheduledAt: scheduledAt,
+            dueAt: dueAt,
+            lastFiredAt: nil,
+            lastSelectorResponded: nil
+        )
         autoUnloadTargets[key] = AutoUnloadTarget(plugin: nsPlugin)
         autoUnloadTasks[key] = Task { [weak self] in
             if seconds == -1 {
@@ -713,12 +893,20 @@ final class ModelManagerService: ObservableObject {
         }
     }
 
+    private func clearAutoUnloadSchedule(for key: ObjectIdentifier) {
+        autoUnloadTasks[key]?.cancel()
+        autoUnloadTasks[key] = nil
+        autoUnloadTargets[key] = nil
+        autoUnloadDiagnostics[key] = nil
+    }
+
     func cancelAutoUnloadTimer() {
         for task in autoUnloadTasks.values {
             task.cancel()
         }
         autoUnloadTasks.removeAll()
         autoUnloadTargets.removeAll()
+        autoUnloadDiagnostics.removeAll()
     }
 
     private func performAutoUnload(for key: ObjectIdentifier) {
@@ -727,10 +915,49 @@ final class ModelManagerService: ObservableObject {
             autoUnloadTargets[key] = nil
         }
 
-        guard let nsPlugin = autoUnloadTargets[key]?.plugin else { return }
+        guard let nsPlugin = autoUnloadTargets[key]?.plugin else {
+            recordAutoUnloadFired(for: key, plugin: nil, selectorResponded: false)
+            return
+        }
         let sel = NSSelectorFromString("triggerAutoUnload")
-        guard nsPlugin.responds(to: sel) else { return }
+        let selectorResponded = nsPlugin.responds(to: sel)
+        recordAutoUnloadFired(for: key, plugin: nsPlugin, selectorResponded: selectorResponded)
+        guard selectorResponded else { return }
         nsPlugin.perform(sel)
+    }
+
+    private func recordAutoUnloadFired(
+        for key: ObjectIdentifier,
+        plugin: NSObject?,
+        selectorResponded: Bool
+    ) {
+        let previous = autoUnloadDiagnostics[key]
+        autoUnloadDiagnostics[key] = ModelAutoUnloadDiagnosticsSnapshot.Entry(
+            pluginClassName: plugin.map { String(describing: type(of: $0)) } ?? previous?.pluginClassName ?? "unknown",
+            pluginObjectIdentifier: previous?.pluginObjectIdentifier ?? Self.diagnosticIdentifier(for: key),
+            policySeconds: previous?.policySeconds ?? autoUnloadSeconds,
+            scheduledAt: nil,
+            dueAt: nil,
+            lastFiredAt: Date(),
+            lastSelectorResponded: selectorResponded
+        )
+    }
+
+    func autoUnloadDiagnosticsSnapshot() -> ModelAutoUnloadDiagnosticsSnapshot {
+        ModelAutoUnloadDiagnosticsSnapshot(
+            policySeconds: autoUnloadSeconds,
+            policyName: ModelAutoUnloadPolicy.policyName(seconds: autoUnloadSeconds),
+            entries: autoUnloadDiagnostics.values.sorted {
+                if $0.pluginClassName == $1.pluginClassName {
+                    return $0.pluginObjectIdentifier < $1.pluginObjectIdentifier
+                }
+                return $0.pluginClassName < $1.pluginClassName
+            }
+        )
+    }
+
+    private static func diagnosticIdentifier(for key: ObjectIdentifier) -> String {
+        String(describing: key)
     }
 
     private func runtimeLanguageSelection(
@@ -776,8 +1003,33 @@ final class ModelManagerService: ObservableObject {
         audio: AudioData,
         languageSelection: PluginLanguageSelection,
         task: TranscriptionTask,
-        prompt: String?
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint]
     ) async throws -> PluginStructuredTranscriptionResult {
+        if !languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let structuredCombinedPlugin = plugin as? StructuredLanguageHintDictionaryTermHintTranscriptionEnginePlugin {
+            return try await structuredCombinedPlugin.transcribeStructured(
+                audio: audio,
+                languageSelection: languageSelection,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
+            )
+        }
+
+        if !languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let combinedPlugin = plugin as? LanguageHintDictionaryTermHintTranscriptionEnginePlugin {
+            return Self.structuredResult(from: try await combinedPlugin.transcribe(
+                audio: audio,
+                languageSelection: languageSelection,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
+            ))
+        }
+
         if !languageSelection.languageHints.isEmpty,
            let structuredHintPlugin = plugin as? StructuredLanguageHintTranscriptionEnginePlugin {
             return try await structuredHintPlugin.transcribeStructured(
@@ -795,6 +1047,28 @@ final class ModelManagerService: ObservableObject {
                 languageSelection: languageSelection,
                 translate: task == .translate,
                 prompt: prompt
+            ))
+        }
+
+        if !dictionaryTermHints.isEmpty,
+           let structuredTermHintPlugin = plugin as? StructuredDictionaryTermHintTranscriptionEnginePlugin {
+            return try await structuredTermHintPlugin.transcribeStructured(
+                audio: audio,
+                language: languageSelection.requestedLanguage,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
+            )
+        }
+
+        if !dictionaryTermHints.isEmpty,
+           let termHintPlugin = plugin as? DictionaryTermHintTranscriptionEnginePlugin {
+            return Self.structuredResult(from: try await termHintPlugin.transcribe(
+                audio: audio,
+                language: languageSelection.requestedLanguage,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
             ))
         }
 
@@ -821,8 +1095,36 @@ final class ModelManagerService: ObservableObject {
         languageSelection: PluginLanguageSelection,
         task: TranscriptionTask,
         prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
         onProgress: @Sendable @escaping (String) -> Bool
     ) async throws -> PluginStructuredTranscriptionResult {
+        if !languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let structuredCombinedPlugin = plugin as? StructuredLanguageHintDictionaryTermHintTranscriptionEnginePlugin {
+            let result = try await structuredCombinedPlugin.transcribeStructured(
+                audio: audio,
+                languageSelection: languageSelection,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
+            )
+            let _ = onProgress(result.text)
+            return result
+        }
+
+        if !languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let combinedPlugin = plugin as? LanguageHintDictionaryTermHintTranscriptionEnginePlugin {
+            return Self.structuredResult(from: try await combinedPlugin.transcribe(
+                audio: audio,
+                languageSelection: languageSelection,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                onProgress: onProgress
+            ))
+        }
+
         if !languageSelection.languageHints.isEmpty,
            let structuredHintPlugin = plugin as? StructuredLanguageHintTranscriptionEnginePlugin,
            !plugin.supportsStreaming {
@@ -843,6 +1145,31 @@ final class ModelManagerService: ObservableObject {
                 languageSelection: languageSelection,
                 translate: task == .translate,
                 prompt: prompt,
+                onProgress: onProgress
+            ))
+        }
+
+        if !dictionaryTermHints.isEmpty,
+           let structuredTermHintPlugin = plugin as? StructuredDictionaryTermHintTranscriptionEnginePlugin {
+            let result = try await structuredTermHintPlugin.transcribeStructured(
+                audio: audio,
+                language: languageSelection.requestedLanguage,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
+            )
+            let _ = onProgress(result.text)
+            return result
+        }
+
+        if !dictionaryTermHints.isEmpty,
+           let termHintPlugin = plugin as? DictionaryTermHintTranscriptionEnginePlugin {
+            return Self.structuredResult(from: try await termHintPlugin.transcribe(
+                audio: audio,
+                language: languageSelection.requestedLanguage,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
                 onProgress: onProgress
             ))
         }
@@ -884,9 +1211,24 @@ final class ModelManagerService: ObservableObject {
         languageSelection: PluginLanguageSelection,
         task: TranscriptionTask,
         prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
         onProgress: @Sendable @escaping (String) -> Bool,
         onSourceProgress: @Sendable @escaping (PluginTranscriptionSourceProgress) -> Bool
     ) async throws -> PluginStructuredTranscriptionResult {
+        if !languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let sourceCombinedPlugin = plugin as? LanguageHintDictionaryTermHintSourceProgressTranscriptionEnginePlugin {
+            return Self.structuredResult(from: try await sourceCombinedPlugin.transcribe(
+                audio: audio,
+                languageSelection: languageSelection,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                onProgress: onProgress,
+                onSourceProgress: onSourceProgress
+            ))
+        }
+
         if !languageSelection.languageHints.isEmpty,
            let sourceHintPlugin = plugin as? SourceProgressLanguageHintTranscriptionEnginePlugin {
             return Self.structuredResult(from: try await sourceHintPlugin.transcribe(
@@ -896,6 +1238,47 @@ final class ModelManagerService: ObservableObject {
                 prompt: prompt,
                 onProgress: onProgress,
                 onSourceProgress: onSourceProgress
+            ))
+        }
+
+        if languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let sourceTermPlugin = plugin as? DictionaryTermHintSourceProgressTranscriptionEnginePlugin {
+            return Self.structuredResult(from: try await sourceTermPlugin.transcribe(
+                audio: audio,
+                language: languageSelection.requestedLanguage,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                onProgress: onProgress,
+                onSourceProgress: onSourceProgress
+            ))
+        }
+
+        if languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let structuredTermHintPlugin = plugin as? StructuredDictionaryTermHintTranscriptionEnginePlugin {
+            let result = try await structuredTermHintPlugin.transcribeStructured(
+                audio: audio,
+                language: languageSelection.requestedLanguage,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
+            )
+            let _ = onProgress(result.text)
+            return result
+        }
+
+        if languageSelection.languageHints.isEmpty,
+           !dictionaryTermHints.isEmpty,
+           let termHintPlugin = plugin as? DictionaryTermHintTranscriptionEnginePlugin {
+            return Self.structuredResult(from: try await termHintPlugin.transcribe(
+                audio: audio,
+                language: languageSelection.requestedLanguage,
+                translate: task == .translate,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                onProgress: onProgress
             ))
         }
 
@@ -917,6 +1300,7 @@ final class ModelManagerService: ObservableObject {
             languageSelection: languageSelection,
             task: task,
             prompt: prompt,
+            dictionaryTermHints: dictionaryTermHints,
             onProgress: onProgress
         )
     }
@@ -974,7 +1358,10 @@ final class ModelManagerService: ObservableObject {
                 throw modelNotLoadedError(for: plugin)
             }
         } else if !plugin.isConfigured {
-            await triggerRestoreModel(plugin)
+            let restoreResult = await triggerRestoreModel(plugin)
+            if case .failed(let message) = restoreResult {
+                throw TranscriptionEngineError.modelLoadFailed(message)
+            }
         }
 
         return overrideRestoreId
@@ -1028,11 +1415,23 @@ final class ModelManagerService: ObservableObject {
 
     /// Trigger model restore via ObjC dispatch (avoids Swift protocol witness table issues
     /// with dynamically loaded plugin bundles) and poll until ready.
-    private func triggerRestoreModel(_ plugin: TranscriptionEnginePlugin) async {
+    private func triggerRestoreModel(_ plugin: TranscriptionEnginePlugin) async -> PluginRestoreResult {
+        let restoreSelector = NSSelectorFromString("triggerRestoreModel")
         guard let nsPlugin = plugin as? NSObject,
-              nsPlugin.responds(to: NSSelectorFromString("triggerRestoreModel")) else { return }
-        _ = nsPlugin.perform(NSSelectorFromString("triggerRestoreModel"))
-        _ = await waitForPluginConfigured(plugin)
+              nsPlugin.responds(to: restoreSelector) else {
+            return .unavailable
+        }
+        _ = nsPlugin.perform(restoreSelector)
+
+        switch await waitForPluginRestoreConfigured(plugin) {
+        case .configured:
+            return .configured
+        case .failed(let message):
+            return .failed(message)
+        case .timedOut(let activity):
+            guard let activity else { return .unavailable }
+            return .failed(Self.restoreTimeoutMessage(activity: activity))
+        }
     }
 
     private func waitForPluginConfigured(
@@ -1040,14 +1439,82 @@ final class ModelManagerService: ObservableObject {
         selectedModelId: String? = nil,
         stopOnMismatchedSelection: Bool = false
     ) async -> Bool {
-        for _ in 0..<300 {
-            try? await Task.sleep(for: .milliseconds(100))
-            guard plugin.isConfigured else { continue }
-            guard let selectedModelId else { return true }
-            let currentModelId = plugin.selectedModelId
-            if currentModelId == selectedModelId { return true }
-            if stopOnMismatchedSelection, currentModelId != nil { return false }
+        for _ in 0..<pluginConfiguredWaitAttempts {
+            if let configured = pluginConfiguredState(
+                plugin,
+                selectedModelId: selectedModelId,
+                stopOnMismatchedSelection: stopOnMismatchedSelection
+            ) {
+                return configured
+            }
+            try? await Task.sleep(for: pluginConfiguredPollInterval)
         }
-        return false
+
+        return pluginConfiguredState(
+            plugin,
+            selectedModelId: selectedModelId,
+            stopOnMismatchedSelection: stopOnMismatchedSelection
+        ) ?? false
+    }
+
+    private func waitForPluginRestoreConfigured(_ plugin: TranscriptionEnginePlugin) async -> PluginRestoreWaitResult {
+        var latestActivity: PluginSettingsActivity?
+
+        for _ in 0..<pluginConfiguredWaitAttempts {
+            if plugin.isConfigured { return .configured }
+            if let activity = pluginSettingsActivity(plugin) {
+                latestActivity = activity
+                if activity.isError {
+                    return .failed(activity.message)
+                }
+            }
+            try? await Task.sleep(for: pluginConfiguredPollInterval)
+        }
+
+        if plugin.isConfigured { return .configured }
+
+        guard latestActivity != nil else {
+            return .timedOut(activity: nil)
+        }
+
+        for _ in 0..<pluginRestoreBusyWaitAttempts {
+            if plugin.isConfigured { return .configured }
+            guard let activity = pluginSettingsActivity(plugin) else {
+                return .timedOut(activity: latestActivity)
+            }
+            latestActivity = activity
+            if activity.isError {
+                return .failed(activity.message)
+            }
+            try? await Task.sleep(for: pluginConfiguredPollInterval)
+        }
+
+        if plugin.isConfigured { return .configured }
+        return .timedOut(activity: latestActivity)
+    }
+
+    private func pluginConfiguredState(
+        _ plugin: TranscriptionEnginePlugin,
+        selectedModelId: String?,
+        stopOnMismatchedSelection: Bool
+    ) -> Bool? {
+        guard plugin.isConfigured else { return nil }
+        guard let selectedModelId else { return true }
+        let currentModelId = plugin.selectedModelId
+        if currentModelId == selectedModelId { return true }
+        if stopOnMismatchedSelection, currentModelId != nil { return false }
+        return nil
+    }
+
+    private func pluginSettingsActivity(_ plugin: TranscriptionEnginePlugin) -> PluginSettingsActivity? {
+        (plugin as? any PluginSettingsActivityReporting)?.currentSettingsActivity
+    }
+
+    private static func restoreTimeoutMessage(activity: PluginSettingsActivity) -> String {
+        let message = activity.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else {
+            return "Timed out while restoring the selected model."
+        }
+        return "Timed out while restoring the selected model: \(message)."
     }
 }

@@ -39,13 +39,15 @@ private actor AsyncTranscriptionGate {
 // MARK: - Plugin Entry Point
 
 @objc(ParakeetPlugin)
-final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, DictionaryTermsCapabilityProviding, TranscriptPreviewFallbackPolicyProviding, PluginSettingsActivityReporting, @unchecked Sendable {
+final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscriptionEnginePlugin, DictionaryTermsCapabilityProviding, TranscriptPreviewFallbackPolicyProviding, PluginSettingsActivityReporting, @unchecked Sendable {
     static let pluginId = "com.typewhisper.parakeet"
     static let pluginName = "Parakeet"
+    static let vocabularyAssetFileName = "parakeet_vocab.json"
     private static let logger = Logger(subsystem: "com.typewhisper.plugin.parakeet", category: "Transcription")
     private static let shortClipConfidenceThreshold: Float = 0.55
     private static let shortClipConfidenceGateDuration: TimeInterval = 1.0
     private static let fluidAudioProgressMinimumSampleCount = 240_000
+    typealias VocabularyAssetFetcher = @Sendable (_ url: URL, _ description: String) async throws -> Data
 
     fileprivate var host: HostServices?
     fileprivate var asrManager: AsrManager?
@@ -95,7 +97,7 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
                 selectedVersion = version
             }
         }
-        if restoresModelOnActivate {
+        if restoresModelOnActivate, host.shouldRestoreLoadedModelsPassively {
             Task { await restoreLoadedModel(allowDownloads: false) }
         }
     }
@@ -188,6 +190,7 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
         language: String?,
         translate: Bool,
         prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
         onProgress: @Sendable @escaping (String) -> Bool,
         onSourceProgress: @Sendable @escaping (PluginTranscriptionSourceProgress) -> Bool
     ) async throws -> PluginTranscriptionResult {
@@ -197,6 +200,7 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
                 language: language,
                 translate: translate,
                 prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
                 onProgress: onProgress,
                 onSourceProgress: onSourceProgress
             )
@@ -208,6 +212,7 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
         language: String?,
         translate: Bool,
         prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint],
         onProgress: @Sendable @escaping (String) -> Bool,
         onSourceProgress: @Sendable @escaping (PluginTranscriptionSourceProgress) -> Bool
     ) async throws -> PluginTranscriptionResult {
@@ -220,7 +225,7 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
         }
 
         if vocabularyBoostingEnabled {
-            await configureBoostingIfNeeded(prompt: prompt)
+            await configureBoostingIfNeeded(prompt: prompt, dictionaryTermHints: dictionaryTermHints)
         }
 
         let normalizedSamples = PluginAudioUtils.paddedSamples(
@@ -417,13 +422,36 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
         }
     }
 
-    private func configureBoostingIfNeeded(prompt: String?) async {
+    static func vocabularyHints(
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint]
+    ) -> [PluginDictionaryTermHint] {
+        if !dictionaryTermHints.isEmpty {
+            return PluginDictionaryTerms.normalizedTermHints(from: dictionaryTermHints)
+        }
+        return PluginDictionaryTerms.termHints(fromPrompt: prompt)
+    }
+
+    static func vocabularySignature(from hints: [PluginDictionaryTermHint]) -> String? {
+        guard !hints.isEmpty else { return nil }
+        return hints.map {
+            let threshold = $0.ctcMinSimilarity.map { String(format: "%.4f", Double($0)) } ?? "auto"
+            return "\($0.text)|\(threshold)"
+        }.joined(separator: "\u{1F}")
+    }
+
+    private func configureBoostingIfNeeded(
+        prompt: String?,
+        dictionaryTermHints: [PluginDictionaryTermHint] = []
+    ) async {
         guard vocabularyBoostingEnabled else { return }
 
-        if prompt == lastConfiguredPrompt { return }
-        lastConfiguredPrompt = prompt
+        let termHints = Self.vocabularyHints(prompt: prompt, dictionaryTermHints: dictionaryTermHints)
+        let signature = Self.vocabularySignature(from: termHints)
+        if signature == lastConfiguredPrompt && (signature != nil || customVocabulary == nil) { return }
+        lastConfiguredPrompt = signature
 
-        guard let prompt, !prompt.isEmpty else {
+        guard !termHints.isEmpty else {
             clearConfiguredVocabulary()
             return
         }
@@ -436,11 +464,10 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
             return
         }
 
-        let termStrings = prompt.split(separator: ",")
-            .map { String($0).trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-
-        let terms = termStrings.compactMap { text -> CustomVocabularyTerm? in
+        // FluidAudio currently exposes only vocabulary-level minSimilarity; per-term
+        // thresholds are preserved in structured hints until the upstream API exists.
+        let terms = termHints.compactMap { hint -> CustomVocabularyTerm? in
+            let text = hint.text
             let ids = ctcTokenizer.encode(text)
             guard !ids.isEmpty else { return nil }
             return CustomVocabularyTerm(text: text, weight: 10.0, ctcTokenIds: ids)
@@ -564,6 +591,7 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
 
         do {
             applyHuggingFaceTokenToEnvironment()
+            try await ensureVocabularyAsset(for: selectedVersion)
             let models = try await AsrModels.downloadAndLoad(version: selectedVersion.asrModelVersion)
             downloadProgress = 0.7
 
@@ -592,6 +620,115 @@ final class ParakeetPlugin: NSObject, SourceProgressTranscriptionEnginePlugin, D
             modelState = .error(error.localizedDescription)
             downloadProgress = 0
         }
+    }
+
+    static func vocabularyAssetURL(for version: ParakeetVersion) -> URL {
+        let repo: String
+        switch version {
+        case .v2:
+            repo = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
+        case .v3:
+            repo = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
+        }
+        return URL(string: "https://huggingface.co/\(repo)/resolve/main/\(vocabularyAssetFileName)")!
+    }
+
+    static func vocabularyAssetDirectory(for version: ParakeetVersion) -> URL {
+        AsrModels.defaultCacheDirectory(for: version.asrModelVersion)
+    }
+
+    func ensureVocabularyAsset(
+        for version: ParakeetVersion,
+        targetDirectory: URL? = nil,
+        fetcher: VocabularyAssetFetcher = { url, description in
+            try await ParakeetPlugin.downloadVocabularyAsset(from: url, description: description)
+        }
+    ) async throws {
+        let directory = targetDirectory ?? Self.vocabularyAssetDirectory(for: version)
+        let targetURL = directory.appendingPathComponent(Self.vocabularyAssetFileName, isDirectory: false)
+        guard !Self.vocabularyAssetExists(at: targetURL) else { return }
+
+        let vocabularyURL = Self.vocabularyAssetURL(for: version)
+        let description = "\(version.modelDef.displayName) vocabulary"
+        let data: Data
+        do {
+            data = try await fetcher(vocabularyURL, description)
+        } catch {
+            throw ParakeetVocabularyAssetError.downloadFailed(version: version, underlying: error)
+        }
+        guard !data.isEmpty else {
+            throw ParakeetVocabularyAssetError.emptyDownload(version: version)
+        }
+
+        let fileManager = FileManager.default
+        var installFailureURL = directory
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            let temporaryURL = directory.appendingPathComponent(
+                ".\(Self.vocabularyAssetFileName).\(UUID().uuidString).tmp",
+                isDirectory: false
+            )
+            installFailureURL = temporaryURL
+            do {
+                try data.write(to: temporaryURL, options: .atomic)
+                if Self.vocabularyAssetExists(at: targetURL) {
+                    try? fileManager.removeItem(at: temporaryURL)
+                    return
+                }
+                installFailureURL = targetURL
+                if fileManager.fileExists(atPath: targetURL.path) {
+                    try fileManager.removeItem(at: targetURL)
+                }
+                try fileManager.moveItem(at: temporaryURL, to: targetURL)
+            } catch {
+                try? fileManager.removeItem(at: temporaryURL)
+                throw error
+            }
+        } catch {
+            throw ParakeetVocabularyAssetError.installFailed(
+                version: version,
+                path: installFailureURL,
+                underlying: error
+            )
+        }
+    }
+
+    private static func vocabularyAssetExists(at url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else {
+            return false
+        }
+        return size.intValue > 0
+    }
+
+    private static func downloadVocabularyAsset(from url: URL, description: String) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 600
+        if let token = currentHuggingFaceToken() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        let (data, response) = try await PluginHTTPClient.data(for: request, resourceTimeout: 600)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ParakeetVocabularyAssetHTTPError(description: description, statusCode: nil)
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw ParakeetVocabularyAssetHTTPError(
+                description: description,
+                statusCode: httpResponse.statusCode
+            )
+        }
+        return data
+    }
+
+    private static func currentHuggingFaceToken() -> String? {
+        for key in PluginHuggingFaceTokenHelper.environmentKeys {
+            if let token = PluginHuggingFaceTokenHelper.normalizedToken(ProcessInfo.processInfo.environment[key]) {
+                return token
+            }
+        }
+        return nil
     }
 
     @objc func triggerAutoUnload() { unloadModel(clearPersistence: false) }
@@ -765,6 +902,35 @@ enum CtcModelState: Equatable {
     case downloading
     case ready
     case error(String)
+}
+
+private struct ParakeetVocabularyAssetHTTPError: LocalizedError, Sendable {
+    let description: String
+    let statusCode: Int?
+
+    var errorDescription: String? {
+        guard let statusCode else {
+            return "Invalid HTTP response while downloading \(description)"
+        }
+        return "HTTP \(statusCode) while downloading \(description)"
+    }
+}
+
+private enum ParakeetVocabularyAssetError: LocalizedError {
+    case downloadFailed(version: ParakeetVersion, underlying: Error)
+    case emptyDownload(version: ParakeetVersion)
+    case installFailed(version: ParakeetVersion, path: URL, underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .downloadFailed(let version, let underlying):
+            return "Failed to download Parakeet vocabulary file for \(version.modelDef.displayName): \(underlying.localizedDescription)"
+        case .emptyDownload(let version):
+            return "Failed to download Parakeet vocabulary file for \(version.modelDef.displayName): downloaded file was empty"
+        case .installFailed(let version, let path, let underlying):
+            return "Failed to install Parakeet vocabulary file for \(version.modelDef.displayName) at \(path.path): \(underlying.localizedDescription)"
+        }
+    }
 }
 
 // MARK: - Settings View

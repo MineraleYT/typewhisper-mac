@@ -126,6 +126,17 @@ enum HotkeySlotType: String, CaseIterable, Sendable {
     }
 }
 
+private extension HotkeySlotType {
+    var startsDictation: Bool {
+        switch self {
+        case .hybrid, .pushToTalk, .toggle:
+            true
+        case .promptPalette, .recentTranscriptions, .copyLastTranscription, .recorderToggle:
+            false
+        }
+    }
+}
+
 /// Manages global hotkeys for dictation and standalone app actions.
 final class HotkeyService: ObservableObject, @unchecked Sendable {
     struct MenuShortcutDescriptor: Equatable, Sendable {
@@ -136,6 +147,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     enum HotkeyEventSource: Sendable {
         case eventTap
         case monitor
+        case carbon
     }
 
     private enum HotkeyDispatchPhase: Hashable {
@@ -156,6 +168,19 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         let hotkey: UnifiedHotkey
     }
 
+    private struct CarbonHotkeyRegistration {
+        enum Target {
+            case slot(HotkeySlotType)
+            case profile(UUID)
+            case workflow(UUID, WorkflowHotkeyBehavior)
+        }
+
+        let id: UInt32
+        let target: Target
+        let hotkey: UnifiedHotkey
+        var ref: EventHotKeyRef?
+    }
+
     enum HotkeyMode: String {
         case pushToTalk
         case toggle
@@ -167,6 +192,14 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     }
 
     @Published private(set) var currentMode: HotkeyMode?
+    @Published var dictationHotkeysPaused: Bool = UserDefaults.standard.bool(forKey: UserDefaultsKeys.dictationHotkeysPaused) {
+        didSet {
+            UserDefaults.standard.set(dictationHotkeysPaused, forKey: UserDefaultsKeys.dictationHotkeysPaused)
+            if dictationHotkeysPaused {
+                resetPausedDictationHotkeyState()
+            }
+        }
+    }
 
     var onDictationStart: ((UInt64) -> Void)?
     var onDictationStop: (() -> Void)?
@@ -183,9 +216,13 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     var modifierFlagsStateProvider: () -> NSEvent.ModifierFlags = {
         NSEvent.ModifierFlags(rawValue: UInt(CGEventSource.flagsState(.combinedSessionState).rawValue))
     }
+    var keyStateProvider: (UInt16) -> Bool = { keyCode in
+        CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(keyCode))
+    }
     var workflowTextProcessingModifierPollInterval: TimeInterval = 0.05
     var workflowTextProcessingModifierReleaseTimeout: TimeInterval = 2.0
     var workflowTextProcessingPostReleaseDelay: TimeInterval = 0.15
+    var hybridModifierHoldActivationDelay: TimeInterval = 0.35
 
     private var keyDownTime: Date?
     private var isActive = false
@@ -194,6 +231,10 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     private(set) var activeProfileId: UUID?
     private(set) var activeWorkflowId: UUID?
     private var pushToTalkInterruptionSignaled = false
+    private var pendingHybridModifierHoldWorkItem: DispatchWorkItem?
+    private var pendingHybridModifierHoldHotkey: UnifiedHotkey?
+    private var pendingHybridModifierHoldGeneration: UInt64 = 0
+    private var activeDelayedHybridModifierHold = false
 
     private static let toggleThreshold: TimeInterval = 1.0
     private static let doubleTapThreshold: TimeInterval = 0.4
@@ -202,6 +243,8 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     private static let escapeHotkey = UnifiedHotkey(keyCode: escapeKeyCode, modifierFlags: 0, isFn: false)
     private static let capsLockKeyCode: UInt16 = 0x39
     private static let capsLockSuppressionWindow: TimeInterval = 0.25
+    private static let carbonHotkeySignature: OSType = "tywh".utf16.reduce(0) { ($0 << 8) + OSType($1) }
+    private nonisolated static let hotkeyEventTapPlacement: CGEventTapPlacement = .headInsertEventTap
 
     nonisolated static func requestTimestamp() -> UInt64 {
         DispatchTime.now().uptimeNanoseconds
@@ -291,12 +334,18 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     private var localMonitor: Any?
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var carbonHotkeyRegistrations: [UInt32: CarbonHotkeyRegistration] = [:]
+    private var carbonHotkeyEventHandlerRef: EventHandlerRef?
     private var recentEventTapDispatches: [HotkeyDispatchKey: Date] = [:]
     private var capsLockOriginSuppressionUntil: Date?
 
     var accessibilityTrustedProvider: () -> Bool = { AXIsProcessTrusted() }
 
     private let logger = Logger(subsystem: AppConstants.loggerSubsystem, category: "HotkeyService")
+
+    deinit {
+        tearDownMonitor()
+    }
 
     // Modifier keyCodes that generate flagsChanged instead of keyDown/keyUp
     nonisolated static let modifierKeyCodes: Set<UInt16> = [
@@ -377,6 +426,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     }
 
     func cancelDictation() {
+        cancelPendingHybridModifierHold()
         isActive = false
         activeSlotType = nil
         activeGlobalHotkey = nil
@@ -385,6 +435,31 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         currentMode = nil
         keyDownTime = nil
         pushToTalkInterruptionSignaled = false
+        activeDelayedHybridModifierHold = false
+    }
+
+    private func resetPausedDictationHotkeyState() {
+        cancelPendingHybridModifierHold()
+
+        for slotType in HotkeySlotType.allCases where slotType.startsDictation {
+            guard var states = slots[slotType] else { continue }
+            for index in states.indices {
+                states[index].resetTransientState()
+            }
+            slots[slotType] = states
+        }
+
+        for profileId in Array(profileSlots.keys) {
+            profileSlots[profileId]?.resetTransientState()
+        }
+
+        for workflowId in Array(workflowSlots.keys) {
+            guard var states = workflowSlots[workflowId] else { continue }
+            for index in states.indices where states[index].behavior == .startDictation {
+                states[index].resetTransientState()
+            }
+            workflowSlots[workflowId] = states
+        }
     }
 
     // MARK: - Profile Hotkeys
@@ -453,6 +528,8 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     }
 
     private func setHotkeys(_ hotkeys: [UnifiedHotkey], for slotType: HotkeySlotType) {
+        cancelPendingHybridModifierHold()
+
         let uniqueHotkeys = Self.uniqueHotkeys(hotkeys)
         slots[slotType] = uniqueHotkeys.map { SlotState(hotkey: $0) }
         persistHotkeys(uniqueHotkeys, for: slotType)
@@ -489,16 +566,19 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     private func setupMonitor() {
         tearDownMonitor()
         let includeMouse = needsMouseEventMonitoring
+        let suppressingMouse = needsSuppressingMouseEventTap
+        let accessibilityTrusted = accessibilityTrustedProvider()
+        installCarbonHotkeys()
 
-        guard accessibilityTrustedProvider() else {
+        guard accessibilityTrusted else {
             logger.info("Accessibility permission not granted, installing local hotkey monitor only")
             installLocalEventMonitor(includeMouse: includeMouse)
             return
         }
 
         // Try CGEventTap first - it can suppress hotkey events from reaching other apps
-        if setupEventTap(includeMouse: needsSuppressingMouseEventTap) {
-            logger.info("Using tail-appended CGEventTap for hotkey monitoring with NSEvent compatibility fallback")
+        if setupEventTap(includeMouse: suppressingMouse) {
+            logger.info("Using head-inserted CGEventTap for hotkey monitoring with NSEvent compatibility fallback")
             installEventMonitors(includeMouse: includeMouse)
             return
         }
@@ -561,6 +641,9 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     }
 
     private func tearDownMonitor() {
+        cancelPendingHybridModifierHold()
+        tearDownCarbonHotkeys()
+
         if let monitor = globalMonitor {
             NSEvent.removeMonitor(monitor)
             globalMonitor = nil
@@ -569,13 +652,22 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             NSEvent.removeMonitor(monitor)
             localMonitor = nil
         }
-        if let tap = eventTap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-            eventTap = nil
-        }
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            // Invalidate the source so it is fully unregistered, not just removed
+            // from the main run loop.
+            CFRunLoopSourceInvalidate(source)
             runLoopSource = nil
+        }
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            // Disabling a tap leaves its Mach port registered with the system, so
+            // each setup/teardown cycle (settings changes, recorder open/close,
+            // wake) would otherwise leak a stale session-level flagsChanged filter
+            // tap. Those linger in the modifier-event path and can break the
+            // system's double-tap-modifier detection (e.g. Apple Dictation).
+            CFMachPortInvalidate(tap)
+            eventTap = nil
         }
         recentEventTapDispatches.removeAll()
         capsLockOriginSuppressionUntil = nil
@@ -587,6 +679,292 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
 
     func resumeMonitoring() {
         setupMonitor()
+    }
+
+    // MARK: - Carbon Hotkeys (works through Secure Input)
+
+    private func installCarbonHotkeys() {
+        tearDownCarbonHotkeys()
+
+        var nextId: UInt32 = 1
+        for slotType in HotkeySlotType.allCases {
+            for state in slots[slotType] ?? [] {
+                guard let hotkey = state.hotkey else { continue }
+                registerCarbonHotkeyIfSupported(
+                    id: nextId,
+                    target: .slot(slotType),
+                    hotkey: hotkey
+                )
+                nextId &+= 1
+            }
+        }
+
+        for (profileId, state) in profileSlots {
+            registerCarbonHotkeyIfSupported(
+                id: nextId,
+                target: .profile(profileId),
+                hotkey: state.hotkey
+            )
+            nextId &+= 1
+        }
+
+        for states in workflowSlots.values {
+            for state in states {
+                registerCarbonHotkeyIfSupported(
+                    id: nextId,
+                    target: .workflow(state.workflowId, state.behavior),
+                    hotkey: state.hotkey
+                )
+                nextId &+= 1
+            }
+        }
+
+        installCarbonEventHandlersIfNeeded()
+    }
+
+    private func registerCarbonHotkeyIfSupported(
+        id: UInt32,
+        target: CarbonHotkeyRegistration.Target,
+        hotkey: UnifiedHotkey
+    ) {
+        guard Self.supportsCarbonHotkey(hotkey) else { return }
+
+        let hotkeyId = EventHotKeyID(signature: Self.carbonHotkeySignature, id: id)
+        let options = UInt32(kEventHotKeyNoOptions)
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            UInt32(hotkey.keyCode),
+            Self.carbonModifierFlags(for: hotkey),
+            hotkeyId,
+            GetEventDispatcherTarget(),
+            options,
+            &ref
+        )
+
+        guard status == noErr, ref != nil else {
+            logger.warning(
+                "RegisterEventHotKey failed: id=\(id, privacy: .public), status=\(status, privacy: .public), hotkey=\(Self.displayName(for: hotkey), privacy: .public)"
+            )
+            return
+        }
+
+        carbonHotkeyRegistrations[id] = CarbonHotkeyRegistration(
+            id: id,
+            target: target,
+            hotkey: hotkey,
+            ref: ref
+        )
+    }
+
+    private func installCarbonEventHandlersIfNeeded() {
+        guard !carbonHotkeyRegistrations.isEmpty, carbonHotkeyEventHandlerRef == nil else { return }
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        var eventTypes = [
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: OSType(kEventHotKeyPressed)
+            ),
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: OSType(kEventHotKeyReleased)
+            ),
+        ]
+        let status = InstallEventHandler(
+            GetEventDispatcherTarget(),
+            Self.carbonHotkeyEventHandler,
+            eventTypes.count,
+            &eventTypes,
+            selfPtr,
+            &carbonHotkeyEventHandlerRef
+        )
+        if status != noErr {
+            logger.warning("InstallEventHandler failed for Carbon hotkey events: status=\(status, privacy: .public)")
+            tearDownCarbonHotkeys()
+        }
+    }
+
+    private static let carbonHotkeyEventHandler: EventHandlerUPP = { _, event, userData in
+        guard let event, let userData else { return noErr }
+        var hotkeyId = EventHotKeyID()
+        let status = GetEventParameter(
+            event,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotkeyId
+        )
+        guard status == noErr, hotkeyId.signature == carbonHotkeySignature else {
+            return noErr
+        }
+
+        let phase: HotkeyDispatchPhase
+        switch GetEventKind(event) {
+        case UInt32(kEventHotKeyPressed):
+            phase = .down
+        case UInt32(kEventHotKeyReleased):
+            phase = .up
+        default:
+            return noErr
+        }
+
+        let service = Unmanaged<HotkeyService>.fromOpaque(userData).takeUnretainedValue()
+        DispatchQueue.main.async {
+            service.handleCarbonHotkey(id: hotkeyId.id, phase: phase)
+        }
+        return noErr
+    }
+
+    private func handleCarbonHotkey(id: UInt32, phase: HotkeyDispatchPhase) {
+        guard let registration = carbonHotkeyRegistrations[id] else { return }
+        handleCarbonHotkey(registration: registration, phase: phase)
+    }
+
+    private func handleCarbonHotkey(
+        registration: CarbonHotkeyRegistration,
+        phase: HotkeyDispatchPhase
+    ) {
+        switch registration.target {
+        case let .slot(slotType):
+            guard !(dictationHotkeysPaused && slotType.startsDictation) else { return }
+            dispatchCarbonGlobalMatch(
+                slotType: slotType,
+                hotkey: registration.hotkey,
+                phase: phase
+            )
+
+        case let .profile(profileId):
+            guard !dictationHotkeysPaused else { return }
+            dispatchCarbonProfileMatch(
+                profileId: profileId,
+                hotkey: registration.hotkey,
+                phase: phase
+            )
+
+        case let .workflow(workflowId, behavior):
+            guard !(dictationHotkeysPaused && behavior == .startDictation) else { return }
+            dispatchCarbonWorkflowMatch(
+                workflowId: workflowId,
+                hotkey: registration.hotkey,
+                behavior: behavior,
+                phase: phase
+            )
+        }
+    }
+
+    private func dispatchCarbonGlobalMatch(
+        slotType: HotkeySlotType,
+        hotkey: UnifiedHotkey,
+        phase: HotkeyDispatchPhase
+    ) {
+        guard shouldDispatch(target: .slot(slotType), phase: phase, hotkey: hotkey, source: .carbon) else {
+            return
+        }
+
+        switch phase {
+        case .down:
+            handleKeyDown(slotType: slotType, hotkey: hotkey)
+        case .up:
+            handleKeyUp(slotType: slotType)
+        }
+    }
+
+    private func dispatchCarbonProfileMatch(
+        profileId: UUID,
+        hotkey: UnifiedHotkey,
+        phase: HotkeyDispatchPhase
+    ) {
+        guard shouldDispatch(target: .profile(profileId), phase: phase, hotkey: hotkey, source: .carbon) else {
+            return
+        }
+
+        switch phase {
+        case .down:
+            handleProfileKeyDown(profileId: profileId)
+        case .up:
+            handleProfileKeyUp(profileId: profileId)
+        }
+    }
+
+    private func dispatchCarbonWorkflowMatch(
+        workflowId: UUID,
+        hotkey: UnifiedHotkey,
+        behavior: WorkflowHotkeyBehavior,
+        phase: HotkeyDispatchPhase
+    ) {
+        if behavior == .processSelectedText,
+           hotkey.kind == .keyWithModifiers,
+           phase == .up,
+           keyStateProvider(hotkey.keyCode) {
+            dispatchCarbonWorkflowKeyUpWhenPhysicalKeyReleases(
+                workflowId: workflowId,
+                hotkey: hotkey,
+                behavior: behavior
+            )
+            return
+        }
+
+        guard shouldDispatch(target: .workflow(workflowId), phase: phase, hotkey: hotkey, source: .carbon) else {
+            return
+        }
+
+        switch phase {
+        case .down:
+            if behavior == .processSelectedText, hotkey.kind == .keyWithModifiers {
+                setWorkflowKeyWasDown(workflowId: workflowId, hotkey: hotkey, keyWasDown: true)
+            }
+            handleWorkflowKeyDown(workflowId: workflowId, behavior: behavior)
+        case .up:
+            handleWorkflowKeyUp(workflowId: workflowId, behavior: behavior)
+        }
+    }
+
+    private func setWorkflowKeyWasDown(workflowId: UUID, hotkey: UnifiedHotkey, keyWasDown: Bool) {
+        guard var states = workflowSlots[workflowId],
+              let index = states.firstIndex(where: { $0.hotkey == hotkey }) else {
+            return
+        }
+        states[index].keyWasDown = keyWasDown
+        workflowSlots[workflowId] = states
+    }
+
+    private func dispatchCarbonWorkflowKeyUpWhenPhysicalKeyReleases(
+        workflowId: UUID,
+        hotkey: UnifiedHotkey,
+        behavior: WorkflowHotkeyBehavior
+    ) {
+        guard activeWorkflowId == workflowId else { return }
+        guard keyStateProvider(hotkey.keyCode) else {
+            guard shouldDispatch(target: .workflow(workflowId), phase: .up, hotkey: hotkey, source: .carbon) else {
+                return
+            }
+            handleWorkflowKeyUp(workflowId: workflowId, behavior: behavior)
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + workflowTextProcessingModifierPollInterval) { [weak self] in
+            self?.dispatchCarbonWorkflowKeyUpWhenPhysicalKeyReleases(
+                workflowId: workflowId,
+                hotkey: hotkey,
+                behavior: behavior
+            )
+        }
+    }
+
+    private func tearDownCarbonHotkeys() {
+        for registration in carbonHotkeyRegistrations.values {
+            if let ref = registration.ref {
+                UnregisterEventHotKey(ref)
+            }
+        }
+        carbonHotkeyRegistrations.removeAll()
+
+        if let handler = carbonHotkeyEventHandlerRef {
+            RemoveEventHandler(handler)
+            carbonHotkeyEventHandlerRef = nil
+        }
     }
 
     // MARK: - CGEventTap (suppresses hotkey events)
@@ -619,7 +997,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
 
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
-            place: .tailAppendEventTap,
+            place: Self.hotkeyEventTapPlacement,
             options: .defaultTap,
             eventsOfInterest: Self.suppressingEventTapMask(includeMouse: includeMouse),
             callback: callback,
@@ -659,6 +1037,9 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             CGEvent.tapEnable(tap: tap, enable: true)
         }
         logger.warning("CGEventTap was disabled by system, re-enabling")
+        DispatchQueue.main.async { [weak self] in
+            self?.recoverReleasedActiveHotkeyAfterEventTapDisable()
+        }
     }
 
     private func handleEventTapCallback(_ event: CGEvent) -> Bool {
@@ -678,17 +1059,21 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     private func handleEvent(_ event: NSEvent, source: HotkeyEventSource) -> Bool {
         // Escape key cancels active recording/transcription
         if event.type == .keyDown && event.keyCode == Self.escapeKeyCode {
+            cancelPendingHybridModifierHold()
             if shouldDispatch(
                 target: .cancel,
                 phase: .down,
                 hotkey: Self.escapeHotkey,
                 source: source
             ) {
-                onCancelPressed?()
+                performHotkeyAction(source: source) { [weak self] in
+                    self?.onCancelPressed?()
+                }
             }
             return false
         }
 
+        cancelPendingHybridModifierHoldIfInterrupted(by: event)
         signalPushToTalkInterruptionIfNeeded(for: event)
         updateCapsLockOriginTracker(for: event)
         var shouldSuppress = false
@@ -699,6 +1084,11 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             for index in states.indices {
                 var state = states[index]
                 guard let hotkey = state.hotkey else { continue }
+                if dictationHotkeysPaused, slotType.startsDictation {
+                    state.resetTransientState()
+                    states[index] = state
+                    continue
+                }
                 let fnTriggerMode: FnTriggerMode = slotType == .toggle ? .releaseOnly : .pressThenRelease
                 if shouldSuppressForCapsLockOrigin(event, hotkey: hotkey, keyWasDown: state.keyWasDown) {
                     state.resetTransientState()
@@ -712,7 +1102,15 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
                     fnTriggerMode: fnTriggerMode
                 )
                 states[index] = state
-                if isMatch { shouldSuppress = true }
+                if shouldSuppressGlobalMatch(
+                    slotType: slotType,
+                    hotkey: hotkey,
+                    keyDown: keyDown,
+                    keyUp: keyUp,
+                    isMatch: isMatch
+                ) {
+                    shouldSuppress = true
+                }
                 dispatchGlobalMatch(
                     slotType: slotType,
                     hotkey: hotkey,
@@ -727,6 +1125,11 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         // Profile slots
         for profileId in Array(profileSlots.keys) {
             guard var pState = profileSlots[profileId] else { continue }
+            if dictationHotkeysPaused {
+                pState.resetTransientState()
+                profileSlots[profileId] = pState
+                continue
+            }
             if shouldSuppressForCapsLockOrigin(event, hotkey: pState.hotkey, keyWasDown: pState.keyWasDown) {
                 pState.resetTransientState()
                 profileSlots[profileId] = pState
@@ -766,6 +1169,11 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             guard var states = workflowSlots[workflowId] else { continue }
             for index in states.indices {
                 var wState = states[index]
+                if dictationHotkeysPaused, wState.behavior == .startDictation {
+                    wState.resetTransientState()
+                    states[index] = wState
+                    continue
+                }
                 if shouldSuppressForCapsLockOrigin(event, hotkey: wState.hotkey, keyWasDown: wState.keyWasDown) {
                     wState.resetTransientState()
                     states[index] = wState
@@ -810,6 +1218,107 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         }
 
         return shouldSuppress
+    }
+
+    private func shouldSuppressGlobalMatch(
+        slotType: HotkeySlotType,
+        hotkey: UnifiedHotkey,
+        keyDown: Bool,
+        keyUp: Bool,
+        isMatch: Bool
+    ) -> Bool {
+        guard isMatch else { return false }
+        guard shouldDelayHybridModifierHold(for: slotType, hotkey: hotkey) else { return true }
+
+        if keyDown { return isActive }
+        if keyUp {
+            return isActive
+                && activeSlotType == .hybrid
+                && activeGlobalHotkey == hotkey
+                && activeDelayedHybridModifierHold
+        }
+        return false
+    }
+
+    private func shouldDelayHybridModifierHold(for slotType: HotkeySlotType, hotkey: UnifiedHotkey) -> Bool {
+        guard slotType == .hybrid, hotkey.kind == .modifierOnly, !hotkey.isDoubleTap else {
+            return false
+        }
+        return Self.modifierFlagForKeyCode(hotkey.keyCode) == .control
+    }
+
+    private func scheduleDelayedHybridModifierHoldStart(for hotkey: UnifiedHotkey) {
+        cancelPendingHybridModifierHold()
+
+        pendingHybridModifierHoldGeneration &+= 1
+        let generation = pendingHybridModifierHoldGeneration
+        pendingHybridModifierHoldHotkey = hotkey
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.activatePendingHybridModifierHold(generation: generation)
+        }
+        pendingHybridModifierHoldWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + hybridModifierHoldActivationDelay,
+            execute: workItem
+        )
+    }
+
+    private func activatePendingHybridModifierHold(generation: UInt64) {
+        guard generation == pendingHybridModifierHoldGeneration,
+              let hotkey = pendingHybridModifierHoldHotkey else {
+            return
+        }
+        guard !dictationHotkeysPaused,
+              !isActive,
+              isModifierOnlyHotkeyStillPressed(hotkey) else {
+            cancelPendingHybridModifierHold()
+            return
+        }
+
+        pendingHybridModifierHoldWorkItem = nil
+        pendingHybridModifierHoldHotkey = nil
+
+        activeSlotType = .hybrid
+        activeGlobalHotkey = hotkey
+        activeProfileId = nil
+        activeWorkflowId = nil
+        keyDownTime = Date()
+        isActive = true
+        pushToTalkInterruptionSignaled = false
+        activeDelayedHybridModifierHold = true
+        currentMode = .pushToTalk
+        onDictationStart?(Self.requestTimestamp())
+    }
+
+    private func cancelPendingHybridModifierHoldIfInterrupted(by event: NSEvent) {
+        guard let hotkey = pendingHybridModifierHoldHotkey else { return }
+
+        switch event.type {
+        case .flagsChanged:
+            if event.keyCode != hotkey.keyCode {
+                cancelPendingHybridModifierHold()
+            }
+        case .keyDown, .otherMouseDown:
+            cancelPendingHybridModifierHold()
+        default:
+            break
+        }
+    }
+
+    private func cancelPendingHybridModifierHold() {
+        pendingHybridModifierHoldWorkItem?.cancel()
+        pendingHybridModifierHoldWorkItem = nil
+        pendingHybridModifierHoldHotkey = nil
+        pendingHybridModifierHoldGeneration &+= 1
+    }
+
+    private func isModifierOnlyHotkeyStillPressed(_ hotkey: UnifiedHotkey) -> Bool {
+        guard hotkey.kind == .modifierOnly,
+              let flag = Self.modifierFlagForKeyCode(hotkey.keyCode) else {
+            return false
+        }
+        return modifierFlagsStateProvider().contains(flag)
     }
 
     private func updateCapsLockOriginTracker(for event: NSEvent) {
@@ -864,14 +1373,18 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             if source != .eventTap {
                 logFallbackMatchIfNeeded(hotkey: hotkey, source: source)
             }
-            handleKeyDown(slotType: slotType, hotkey: hotkey)
+            performHotkeyAction(source: source) { [weak self] in
+                self?.handleKeyDown(slotType: slotType, hotkey: hotkey)
+            }
         } else if keyUp, shouldDispatch(
             target: .slot(slotType),
             phase: .up,
             hotkey: hotkey,
             source: source
         ) {
-            handleKeyUp(slotType: slotType)
+            performHotkeyAction(source: source) { [weak self] in
+                self?.handleKeyUp(slotType: slotType)
+            }
         }
     }
 
@@ -891,14 +1404,18 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             if source != .eventTap {
                 logFallbackMatchIfNeeded(hotkey: hotkey, source: source)
             }
-            handleProfileKeyDown(profileId: profileId)
+            performHotkeyAction(source: source) { [weak self] in
+                self?.handleProfileKeyDown(profileId: profileId)
+            }
         } else if keyUp, shouldDispatch(
             target: .profile(profileId),
             phase: .up,
             hotkey: hotkey,
             source: source
         ) {
-            handleProfileKeyUp(profileId: profileId)
+            performHotkeyAction(source: source) { [weak self] in
+                self?.handleProfileKeyUp(profileId: profileId)
+            }
         }
     }
 
@@ -924,14 +1441,30 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             if source != .eventTap {
                 logFallbackMatchIfNeeded(hotkey: hotkey, source: source)
             }
-            handleWorkflowKeyDown(workflowId: workflowId, behavior: behavior)
+            performHotkeyAction(source: source) { [weak self] in
+                self?.handleWorkflowKeyDown(workflowId: workflowId, behavior: behavior)
+            }
         } else if keyUp, !isTextProcessingModifierRelease, shouldDispatch(
             target: .workflow(workflowId),
             phase: .up,
             hotkey: hotkey,
             source: source
         ) {
-            handleWorkflowKeyUp(workflowId: workflowId, behavior: behavior)
+            performHotkeyAction(source: source) { [weak self] in
+                self?.handleWorkflowKeyUp(workflowId: workflowId, behavior: behavior)
+            }
+        }
+    }
+
+    private func performHotkeyAction(
+        source: HotkeyEventSource,
+        _ action: @escaping @Sendable () -> Void
+    ) {
+        switch source {
+        case .eventTap:
+            DispatchQueue.main.async(execute: action)
+        case .monitor, .carbon:
+            action()
         }
     }
 
@@ -975,12 +1508,13 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         }
 
         let dispatchKey = HotkeyDispatchKey(target: target, phase: phase, hotkey: hotkey)
-        if source == .eventTap {
-            recentEventTapDispatches[dispatchKey] = now
-            return true
+        if let recentDispatch = recentEventTapDispatches[dispatchKey],
+           now.timeIntervalSince(recentDispatch) < Self.monitorDedupWindow {
+            return false
         }
 
-        return recentEventTapDispatches[dispatchKey] == nil
+        recentEventTapDispatches[dispatchKey] = now
+        return true
     }
 
     private func logFallbackMatchIfNeeded(hotkey: UnifiedHotkey, source: HotkeyEventSource) {
@@ -988,12 +1522,72 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         logger.info("Matched hotkey via NSEvent compatibility fallback: \(Self.displayName(for: hotkey), privacy: .public)")
     }
 
+    private func recoverReleasedActiveHotkeyAfterEventTapDisable() {
+        guard isActive,
+              currentMode == .pushToTalk,
+              activeProfileId == nil,
+              activeWorkflowId == nil,
+              let slotType = activeSlotType,
+              let hotkey = activeGlobalHotkey,
+              !isHotkeyPhysicallyPressed(hotkey) else {
+            return
+        }
+
+        logger.warning(
+            "Recovering active dictation after CGEventTap disable; hotkey is no longer pressed: \(Self.displayName(for: hotkey), privacy: .public)"
+        )
+        handleKeyUp(slotType: slotType)
+    }
+
+    private func isHotkeyPhysicallyPressed(_ hotkey: UnifiedHotkey) -> Bool {
+        switch hotkey.kind {
+        case .fn:
+            return modifierFlagsStateProvider().contains(.function)
+        case .modifierOnly:
+            guard let flag = Self.modifierFlagForKeyCode(hotkey.keyCode) else { return false }
+            return modifierFlagsStateProvider().contains(flag)
+        case .modifierCombo:
+            let flags = modifierFlagsStateProvider()
+            if !hotkey.modifierKeyCodes.isEmpty {
+                let activeModifierKeyCodes = Self.modifierKeyCodes(from: flags)
+                return hotkey.modifierKeyCodes.isSubset(of: activeModifierKeyCodes)
+            }
+            let requiredFlags = NSEvent.ModifierFlags(rawValue: hotkey.modifierFlags)
+            let relevantMask: NSEvent.ModifierFlags = [.command, .option, .control, .shift, .function]
+            return flags.intersection(relevantMask).isSuperset(of: requiredFlags)
+        case .keyWithModifiers, .bareKey:
+            return keyStateProvider(hotkey.keyCode)
+        case .mouseButton:
+            return true
+        }
+    }
+
+    private nonisolated static func supportsCarbonHotkey(_ hotkey: UnifiedHotkey) -> Bool {
+        hotkey.kind == .keyWithModifiers
+            && !hotkey.isDoubleTap
+            && hotkey.mouseButton == nil
+            && carbonModifierFlags(for: hotkey) != 0
+    }
+
+    private nonisolated static func carbonModifierFlags(for hotkey: UnifiedHotkey) -> UInt32 {
+        let flags = NSEvent.ModifierFlags(rawValue: hotkey.modifierFlags)
+        var carbonFlags: UInt32 = 0
+        if flags.contains(.command) { carbonFlags |= UInt32(cmdKey) }
+        if flags.contains(.option) { carbonFlags |= UInt32(optionKey) }
+        if flags.contains(.control) { carbonFlags |= UInt32(controlKey) }
+        if flags.contains(.shift) { carbonFlags |= UInt32(shiftKey) }
+        if flags.contains(.function) { carbonFlags |= UInt32(kEventKeyModifierFnMask) }
+        return carbonFlags
+    }
+
 #if DEBUG
     func setHotkeyForTesting(_ hotkey: UnifiedHotkey, for slotType: HotkeySlotType) {
+        cancelPendingHybridModifierHold()
         slots[slotType] = [SlotState(hotkey: hotkey)]
     }
 
     func setHotkeysForTesting(_ hotkeys: [UnifiedHotkey], for slotType: HotkeySlotType) {
+        cancelPendingHybridModifierHold()
         slots[slotType] = Self.uniqueHotkeys(hotkeys).map { SlotState(hotkey: $0) }
     }
 
@@ -1006,6 +1600,10 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         handleEvent(event, source: source)
     }
 
+    func recoverReleasedActiveHotkeyAfterEventTapDisableForTesting() {
+        recoverReleasedActiveHotkeyAfterEventTapDisable()
+    }
+
     func needsMouseEventMonitoringForTesting() -> Bool {
         needsMouseEventMonitoring
     }
@@ -1016,6 +1614,47 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
 
     static func suppressingEventTapMaskForTesting(includeMouse: Bool = false) -> CGEventMask {
         suppressingEventTapMask(includeMouse: includeMouse)
+    }
+
+    static func eventTapPlacementForTesting() -> CGEventTapPlacement {
+        hotkeyEventTapPlacement
+    }
+
+    static func supportsCarbonHotkeyForTesting(_ hotkey: UnifiedHotkey) -> Bool {
+        supportsCarbonHotkey(hotkey)
+    }
+
+    static func carbonModifierFlagsForTesting(_ hotkey: UnifiedHotkey) -> UInt32 {
+        carbonModifierFlags(for: hotkey)
+    }
+
+    func processCarbonHotkeyForTesting(
+        slotType: HotkeySlotType,
+        hotkey: UnifiedHotkey,
+        isPressed: Bool
+    ) {
+        let registration = CarbonHotkeyRegistration(
+            id: 1,
+            target: .slot(slotType),
+            hotkey: hotkey,
+            ref: nil
+        )
+        handleCarbonHotkey(registration: registration, phase: isPressed ? .down : .up)
+    }
+
+    func processCarbonWorkflowHotkeyForTesting(
+        workflowId: UUID,
+        hotkey: UnifiedHotkey,
+        behavior: WorkflowHotkeyBehavior,
+        isPressed: Bool
+    ) {
+        let registration = CarbonHotkeyRegistration(
+            id: 1,
+            target: .workflow(workflowId, behavior),
+            hotkey: hotkey,
+            ref: nil
+        )
+        handleCarbonHotkey(registration: registration, phase: isPressed ? .down : .up)
     }
 #endif
 
@@ -1309,6 +1948,11 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             return
         }
 
+        if !isActive, shouldDelayHybridModifierHold(for: slotType, hotkey: hotkey) {
+            scheduleDelayedHybridModifierHoldStart(for: hotkey)
+            return
+        }
+
         if isActive {
             // Any hotkey stops active recording
             isActive = false
@@ -1319,6 +1963,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             currentMode = nil
             keyDownTime = nil
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             onDictationStop?()
         } else {
             let requestTimestamp = Self.requestTimestamp()
@@ -1329,12 +1974,18 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             keyDownTime = Date()
             isActive = true
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             currentMode = slotType == .toggle ? .toggle : .pushToTalk
             onDictationStart?(requestTimestamp)
         }
     }
 
     private func handleKeyUp(slotType: HotkeySlotType) {
+        if slotType == .hybrid, pendingHybridModifierHoldWorkItem != nil {
+            cancelPendingHybridModifierHold()
+            return
+        }
+
         guard isActive, slotType == activeSlotType, activeProfileId == nil, activeWorkflowId == nil else { return }
 
         switch slotType {
@@ -1342,6 +1993,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             guard let downTime = keyDownTime else { return }
             if Date().timeIntervalSince(downTime) < Self.toggleThreshold {
                 currentMode = .toggle
+                activeDelayedHybridModifierHold = false
             } else {
                 isActive = false
                 activeSlotType = nil
@@ -1349,6 +2001,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
                 currentMode = nil
                 keyDownTime = nil
                 pushToTalkInterruptionSignaled = false
+                activeDelayedHybridModifierHold = false
                 onDictationStop?()
             }
         case .pushToTalk:
@@ -1358,6 +2011,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             currentMode = nil
             keyDownTime = nil
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             onDictationStop?()
         case .toggle:
             break
@@ -1385,6 +2039,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             currentMode = nil
             keyDownTime = nil
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             onDictationStop?()
         } else {
             let requestTimestamp = Self.requestTimestamp()
@@ -1395,6 +2050,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             keyDownTime = Date()
             isActive = true
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             currentMode = .pushToTalk // hybrid behavior
             onProfileDictationStart?(profileId, requestTimestamp)
         }
@@ -1416,6 +2072,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             currentMode = nil
             keyDownTime = nil
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             onDictationStop?()
         }
     }
@@ -1433,6 +2090,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
                 currentMode = nil
                 keyDownTime = nil
                 pushToTalkInterruptionSignaled = false
+                activeDelayedHybridModifierHold = false
                 onDictationStop?()
                 return
             }
@@ -1449,6 +2107,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             currentMode = nil
             keyDownTime = nil
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             onDictationStop?()
         } else {
             let requestTimestamp = Self.requestTimestamp()
@@ -1459,6 +2118,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             keyDownTime = Date()
             isActive = true
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             currentMode = .pushToTalk
             onWorkflowDictationStart?(workflowId, requestTimestamp)
         }
@@ -1485,6 +2145,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             currentMode = nil
             keyDownTime = nil
             pushToTalkInterruptionSignaled = false
+            activeDelayedHybridModifierHold = false
             onDictationStop?()
         }
     }

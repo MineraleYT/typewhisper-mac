@@ -6,9 +6,9 @@
 
 Speech-to-text and AI text processing for macOS. Transcribe audio using on-device AI models or cloud APIs (Groq, OpenAI, xAI/Grok), then transform the result with reusable workflows. Your voice data stays on your Mac with local models - or use cloud APIs for faster processing.
 
-TypeWhisper `1.4` is the current stable release for macOS. It includes system-wide dictation, file transcription, unified workflows, history, dictionary, snippets, bundled integrations, the community plugin registry, and local automation APIs. Advanced surfaces like the HTTP API, CLI, widgets, watch folders, and the plugin SDK remain supported for power users and automation.
+TypeWhisper `1.5` is the current stable release for macOS. It includes system-wide dictation, file transcription, unified workflows, history, dictionary, snippets, bundled integrations, the community plugin registry, local automation APIs, app-aware insertion, expanded provider support, and local-model reliability improvements. The `main` branch is now preparing the `1.6` release-candidate line; `1.5` receives hotfixes only from `release/1.5`.
 
-See the [release readiness guide](docs/release-readiness.md), [support matrix](docs/support-matrix.md), and [release checklist](docs/release-checklist.md) for the current release definition and ship gates.
+See the [release readiness guide](docs/release-readiness.md), [support matrix](docs/support-matrix.md), and [release checklist](docs/release-checklist.md) for the active `1.6` release definition and ship gates.
 
 <p align="center">
   <video src="https://github.com/user-attachments/assets/22fe922d-4a4c-47d1-805e-684a148ebd03" autoplay loop muted playsinline width="270"></video>
@@ -20,45 +20,51 @@ See the [release readiness guide](docs/release-readiness.md), [support matrix](d
 
 <p align="center">
   <a href=".github/screenshots/home.png"><img src=".github/screenshots/home.png" width="270" alt="Home Dashboard"></a>
-  <a href=".github/screenshots/recording.png"><img src=".github/screenshots/recording.png" width="270" alt="Recording &amp; Hotkeys"></a>
-  <a href=".github/screenshots/workflows.png"><img src=".github/screenshots/workflows.png" width="270" alt="Workflows"></a>
+  <a href=".github/screenshots/recording.png"><img src=".github/screenshots/recording.png" width="270" alt="Recording"></a>
+  <a href=".github/screenshots/recovery.png"><img src=".github/screenshots/recovery.png" width="270" alt="Recovery"></a>
 </p>
 
 <p align="center">
-  <a href=".github/screenshots/plugins.png"><img src=".github/screenshots/plugins.png" width="270" alt="Installed Integrations"></a>
-  <a href=".github/screenshots/integrations-available.png"><img src=".github/screenshots/integrations-available.png" width="270" alt="Available Integrations"></a>
+  <a href=".github/screenshots/hotkeys.png"><img src=".github/screenshots/hotkeys.png" width="270" alt="Hotkeys"></a>
+  <a href=".github/screenshots/workflows.png"><img src=".github/screenshots/workflows.png" width="270" alt="Workflows"></a>
   <a href=".github/screenshots/file-transcription.png"><img src=".github/screenshots/file-transcription.png" width="270" alt="File Transcription"></a>
 </p>
 
 <p align="center">
+  <a href=".github/screenshots/recorder.png"><img src=".github/screenshots/recorder.png" width="270" alt="Recorder API"></a>
   <a href=".github/screenshots/history.png"><img src=".github/screenshots/history.png" width="270" alt="History"></a>
   <a href=".github/screenshots/dictionary.png"><img src=".github/screenshots/dictionary.png" width="270" alt="Dictionary"></a>
-  <a href=".github/screenshots/dictionary-term-packs.png"><img src=".github/screenshots/dictionary-term-packs.png" width="270" alt="Dictionary Term Packs"></a>
 </p>
 
 <p align="center">
+  <a href=".github/screenshots/dictionary-term-packs.png"><img src=".github/screenshots/dictionary-term-packs.png" width="270" alt="Dictionary Term Packs"></a>
   <a href=".github/screenshots/snippets.png"><img src=".github/screenshots/snippets.png" width="270" alt="Snippets"></a>
+  <a href=".github/screenshots/plugins.png"><img src=".github/screenshots/plugins.png" width="270" alt="Installed Integrations"></a>
+</p>
+
+<p align="center">
+  <a href=".github/screenshots/integrations-available.png"><img src=".github/screenshots/integrations-available.png" width="270" alt="Integration Marketplace"></a>
+  <a href=".github/screenshots/premium.png"><img src=".github/screenshots/premium.png" width="270" alt="Premium"></a>
+  <a href=".github/screenshots/license.png"><img src=".github/screenshots/license.png" width="270" alt="License"></a>
+</p>
+
+<p align="center">
   <a href=".github/screenshots/general.png"><img src=".github/screenshots/general.png" width="270" alt="General Settings"></a>
   <a href=".github/screenshots/advanced.png"><img src=".github/screenshots/advanced.png" width="270" alt="Advanced Settings"></a>
-</p>
-
-<p align="center">
-  <a href=".github/screenshots/recorder.png"><img src=".github/screenshots/recorder.png" width="270" alt="Recorder API"></a>
-  <a href=".github/screenshots/menu-bar.png"><img src=".github/screenshots/menu-bar.png" width="270" alt="Menu Bar"></a>
   <a href=".github/screenshots/about.png"><img src=".github/screenshots/about.png" width="270" alt="About"></a>
 </p>
 
 <!-- readme-screenshots:end -->
 
-## What's New in 1.4
+## What's New in 1.5
 
-- **Redesigned Integrations** - Installed, Discover, and Manual tabs now group built-in, marketplace, community, and manually installed plugins with clearer source, hosting, and capability metadata
-- **Community plugin registry** - `1.4` builds can discover community plugins through the new registry feed while older `1.3.x` builds stay on the official marketplace feed
-- **Model download controls** - Local model plugins now have clearer downloaded model management, host-version gates, Hugging Face token support, and license acceptance flows where required
-- **New bundled providers** - xAI/Grok, Smallest AI Pulse, Supertonic TTS, refreshed OpenAI voices, Qwen3 ASR, Granite, Voxtral, and Gemma 4 expand the bundled plugin set
-- **Local automation APIs** - Recorder and dictionary HTTP endpoints, watch-folder file jobs, per-request STT engine/model overrides, and CLI/API improvements give power users more automation surface
-- **Workflow and hotkey polish** - Workflow drag reordering, multiple global hotkeys per action, prompt-boundary hardening, direct text hotkeys, and safer Apple Intelligence handling improve day-to-day dictation flows
-- **Dictation reliability pass** - Live transcript, recording indicators, fullscreen/fixed-display handling, USB and multichannel audio capture, route-change recovery, and hotkey startup latency all received focused fixes
+- **App-aware dictation insertion** - Dictation output now better respects sentence position, trailing spaces, terminal paste behavior, rich-text targets, and target-app context
+- **Expanded speech and AI providers** - Gemini speech transcription, Cartesia speech transcription, Sber SaluteSpeech, OpenRouter speech-to-text, Reson8, Mistral AI, Soniox regions and TTS, and OpenAI-compatible profiles broaden the bundled provider set
+- **Local model reliability** - MLX memory-footprint controls, idle auto-unload behavior, stalled Gemma 4 download recovery, and Parakeet vocabulary repair improve local model setup and day-to-day stability
+- **Dictionary learning and normalization** - Auto-learned corrections, target-app correction learning, per-term CTC tuning plumbing, multilingual number-word normalization, English ordinals, digit sequences, and French decimal cleanup improve recognition output
+- **Workflow and hotkey reliability** - Hybrid modifier timing, non-Control modifier taps, global push-to-talk, Pages workflow hotkeys, menu-based dictation pause, Esc confirmation, and automatic workflow output resolution all received targeted fixes
+- **Recording and indicator polish** - Virtual audio input support, media pause/resume hardening, fullscreen indicator fixes, recorder final-failure surfacing, FaceTime built-in microphone capture, and TaskForge insertion fallback improve real-world capture and insertion flows
+- **Release and plugin metadata cleanup** - Cloud ASR upload fallback handling, plugin host-compatibility metadata, plugin uninstall cleanup, and GitHub Latest protection keep the 1.5 distribution path clean
 
 ## Features
 
@@ -82,7 +88,7 @@ See the [release readiness guide](docs/release-readiness.md), [support matrix](d
 ### AI Processing
 
 - **Workflows** - Build reusable transformations for translation, rewriting, extraction, formatting, and app-specific automation. Workflows can run automatically by app, website, or app + website combinations, from a dedicated hotkey, as a global fallback, or manually from the Workflow Palette. Hotkey workflows can either start dictation or process the current selection/clipboard directly.
-- **LLM providers** - Apple Intelligence (macOS 26+), Groq, OpenAI / ChatGPT, xAI/Grok, Gemini, and OpenAI Compatible with per-prompt provider and model override
+- **LLM provider fallbacks** - Order Apple Intelligence (macOS 26+), Groq, OpenAI / ChatGPT, xAI/Grok, Gemini, OpenAI Compatible, and local providers in one global provider/model list. Prompts and workflows inherit that order by default; a workflow with an explicit provider stays on that single provider
 - **Speech providers** - System voices, xAI/Grok TTS, and experimental local Supertonic TTS can provide spoken feedback and readback
 - **Local prompt processing** - Gemma 4 via MLX runs on-device on Apple Silicon, with the current verified release path limited to the E2B/E4B 4-bit models
 - **Translation** - Translate transcriptions on-device using Apple Translate
@@ -90,7 +96,7 @@ See the [release readiness guide](docs/release-readiness.md), [support matrix](d
 ### Personalization
 
 - **Workflow triggers** - Per-app, per-website, combined app + website, hotkey, global fallback, and manual palette-only triggers for language, task, engine, prompt, and auto-submit behavior. Website matching supports subdomains
-- **Dictionary** - Terms improve cloud recognition accuracy. Corrections fix common transcription mistakes automatically. Auto-learns from manual corrections. Includes importable term packs
+- **Dictionary** - Terms improve cloud recognition accuracy. Corrections fix common transcription mistakes automatically. Auto-learns high-confidence local single-word manual corrections, while broader rewrites and deletions are skipped. Includes importable term packs
 - **Localized term packs** - Built-in term pack names and descriptions are localized in English and German
 - **Snippets** - Text shortcuts with trigger/replacement. Supports placeholders like `{{DATE}}`, `{{TIME}}`, and `{{CLIPBOARD}}`
 - **History** - Searchable transcription history with inline editing, correction detection, app context tracking, timeline grouping, filters, bulk delete, multi-select export, auto-retention, and a standalone window accessible from the tray menu
@@ -124,7 +130,7 @@ brew install --cask typewhisper/tap/typewhisper
 
 Download the latest DMG from [GitHub Releases](https://github.com/TypeWhisper/typewhisper-mac/releases/latest).
 
-Stable direct-download releases use the default Sparkle channel. Release candidates such as `1.4.0-rc*` and daily builds are published as GitHub prereleases, update the shared Sparkle appcast on their own channels, and are excluded from Homebrew.
+Stable direct-download releases use the default Sparkle channel. Release candidates such as `1.6.0-rc*` and daily builds such as `v1.6.0-daily.*` are published as GitHub prereleases, update the shared Sparkle appcast on their own channels, and are excluded from Homebrew.
 Installed builds can switch channels in `Settings -> About` via the `Update Channel` picker.
 
 ## Quick Start
@@ -495,6 +501,8 @@ Workflows let you configure transcription, transformation, and automation behavi
 
 Create workflows in Settings > Workflows. Choose a template, then use Automatic to enable app, website, hotkey, or any combination of those trigger components. Always stays the global fallback, and Manual keeps the workflow palette-only. Hotkey workflows choose whether the shortcut starts dictation or processes the current selection/clipboard through the same insertion path as the Workflow Palette. Spoken language can be left on full auto-detect, fixed to one exact language, or restricted to a shortlist of likely languages for better detection accuracy. Website patterns support subdomain matching - e.g. `google.com` also matches `docs.google.com`.
 
+LLM Prompt workflows inherit the ordered global LLM fallback list shown at the top of Settings > Workflows. TypeWhisper moves to the next provider/model when an inherited attempt is unavailable, cannot restore, is rate-limited, hits a network or API error, or returns no text. Selecting a provider inside a workflow disables that fallback behavior for the workflow and makes one strict provider call instead.
+
 When you start dictating, TypeWhisper matches the active app and browser URL against enabled workflows with the following priority:
 1. **App + URL match** - highest specificity (e.g. Chrome + github.com)
 2. **URL-only match** - cross-browser workflows (e.g. github.com in any browser)
@@ -505,7 +513,7 @@ Hotkeys are direct workflow shortcuts, not context conditions in the app/URL mat
 
 The active workflow name is shown as a badge in the indicator, together with a short explanation of why it matched.
 
-Multiple engines can be loaded simultaneously for instant switching between workflows. Note that loading multiple local models increases memory usage. Cloud engines (Groq, OpenAI, xAI/Grok) have negligible memory overhead.
+Multiple engines can be loaded simultaneously during a session for instant switching between workflows. Note that loading multiple local models increases memory usage. Set `Auto-unload model` to `Never` if you want TypeWhisper to restore previously loaded local models at launch; any active auto-unload policy keeps startup lazy and reloads the selected/downloaded model on first real use. Cloud engines (Groq, OpenAI, xAI/Grok) have negligible memory overhead.
 
 ## Plugins
 

@@ -9,6 +9,8 @@ enum DictionaryExporter {
         let replacement: String?
         let caseSensitive: Bool
         let isEnabled: Bool
+        let ctcMinSimilarity: Float?
+        let source: DictionaryEntrySource
     }
 
     struct ImportResult {
@@ -28,6 +30,12 @@ enum DictionaryExporter {
             ]
             if let replacement = entry.replacement {
                 dict["replacement"] = replacement
+            }
+            if entry.type == .term, let ctcMinSimilarity = entry.ctcMinSimilarity {
+                dict["ctcMinSimilarity"] = ctcMinSimilarity
+            }
+            if entry.type == .correction, entry.source == .autoLearned {
+                dict["source"] = entry.source.rawValue
             }
             return dict
         }
@@ -84,7 +92,13 @@ enum DictionaryExporter {
                 original: original,
                 replacement: replacement,
                 caseSensitive: dict["caseSensitive"] as? Bool ?? false,
-                isEnabled: dict["isEnabled"] as? Bool ?? true
+                isEnabled: dict["isEnabled"] as? Bool ?? true,
+                ctcMinSimilarity: type == .term ? parseOptionalFloat(
+                    dict["ctcMinSimilarity"] ?? dict["ctc_min_similarity"]
+                ) : nil,
+                source: type == .correction
+                    ? DictionaryEntrySource.source(for: dict["source"] as? String)
+                    : .manual
             )
         }
     }
@@ -95,13 +109,28 @@ enum DictionaryExporter {
 
         let items = parsed.map {
             (type: $0.type, original: $0.original, replacement: $0.replacement,
-             caseSensitive: $0.caseSensitive, isEnabled: $0.isEnabled)
+             caseSensitive: $0.caseSensitive, isEnabled: $0.isEnabled,
+             ctcMinSimilarity: $0.ctcMinSimilarity, source: $0.source)
         }
         service.importEntries(items)
 
         let after = service.entries.count
         let imported = after - before
         return ImportResult(imported: imported, skipped: parsed.count - imported)
+    }
+
+    private static func parseOptionalFloat(_ rawValue: Any?) -> Float? {
+        switch rawValue {
+        case let value as Float:
+            return value.isFinite ? min(max(value, 0), 1) : nil
+        case let value as Double:
+            guard value.isFinite else { return nil }
+            return Float(min(max(value, 0), 1))
+        case let value as Int:
+            return Float(min(max(value, 0), 1))
+        default:
+            return nil
+        }
     }
 }
 

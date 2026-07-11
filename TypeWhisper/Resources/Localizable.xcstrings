@@ -1021,6 +1021,22 @@
         }
       }
     },
+    "Add Microphone": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mikrofon hinzufügen"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "マイクを追加"
+          }
+        }
+      }
+    },
     "Add Correction": {
       "localizations": {
         "de": {
@@ -3517,6 +3533,22 @@
         }
       }
     },
+    "Dictation hotkeys paused": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diktat-Hotkeys pausiert"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ディクテーションのホットキーは一時停止中"
+          }
+        }
+      }
+    },
     "Dictionary": {
       "localizations": {
         "de": {
@@ -3664,6 +3696,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "メニューバーアイコン非表示時にDockアイコンを表示"
+          }
+        }
+      }
+    },
+    "Disconnected": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Getrennt"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "接続解除"
           }
         }
       }
@@ -6335,6 +6383,22 @@
         }
       }
     },
+    "Microphone Priority": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mikrofon-Priorität"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "マイクの優先順位"
+          }
+        }
+      }
+    },
     "Microphone access is required for dictation.": {
       "extractionState": "stale",
       "localizations": {
@@ -6625,6 +6689,38 @@
           "stringUnit": {
             "state": "translated",
             "value": "マウスボタン 5"
+          }
+        }
+      }
+    },
+    "Move Down": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nach unten bewegen"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "下へ移動"
+          }
+        }
+      }
+    },
+    "Move Up": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nach oben bewegen"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上へ移動"
           }
         }
       }
@@ -7031,6 +7127,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "マイクが認識されていません。"
+          }
+        }
+      }
+    },
+    "No more microphones": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keine weiteren Mikrofone"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "追加できるマイクはありません"
           }
         }
       }
@@ -7822,6 +7934,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "録音中のメディア再生を一時停止"
+          }
+        }
+      }
+    },
+    "Pause Dictation Hotkeys": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diktat-Hotkeys pausieren"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ディクテーションのホットキーを一時停止"
           }
         }
       }
@@ -9281,6 +9409,138 @@
         }
       }
     },
+    "recorder.emptyFinalTranscriptionError": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die finale Transkription hat keinen Text zurueckgegeben."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Final transcription returned no text."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最終文字起こしはテキストを返しませんでした。"
+          }
+        }
+      }
+    },
+    "recorder.failurePhase.emptyResult": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "leeres Ergebnis"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "empty result"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "空の結果"
+          }
+        }
+      }
+    },
+    "recorder.failurePhase.finalTranscription": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "finaler Transkription"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "final transcription"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最終文字起こし"
+          }
+        }
+      }
+    },
+    "recorder.failurePhase.preparingFinalAudio": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vorbereitung des finalen Audios"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "preparing final audio"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最終音声の準備"
+          }
+        }
+      }
+    },
+    "recorder.failurePhase.savingTranscript": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Speichern des Transkripts"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "saving transcript"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文字起こしの保存"
+          }
+        }
+      }
+    },
+    "recorder.failureMetadataSaveError": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Fehler-Metadaten konnten nicht gespeichert werden: %@"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ Failed to save failure metadata: %@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 失敗メタデータを保存できませんでした: %@"
+          }
+        }
+      }
+    },
     "recorder.language": {
       "extractionState": "stale",
       "localizations": {
@@ -9900,6 +10160,72 @@
         }
       }
     },
+    "recorder.transcriptionFailed": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Transkription fehlgeschlagen"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Transcription failed"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文字起こしに失敗しました"
+          }
+        }
+      }
+    },
+    "recorder.transcriptionFailureAPISummary": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Transkription fehlgeschlagen waehrend %@: %@"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Transcription failed during %@: %@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@中に文字起こしに失敗しました: %@"
+          }
+        }
+      }
+    },
+    "recorder.transcriptionFailureSummary": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Transkription fehlgeschlagen fuer %@, %@ waehrend %@: %@"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Transcription failed for %@, %@ during %@: %@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文字起こしに失敗しました（長さ %@、サイズ %@、%@中）: %@"
+          }
+        }
+      }
+    },
     "recorder.transcriptionSettingsDisabledHint": {
       "localizations": {
         "de": {
@@ -10321,6 +10647,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "貼り付け後、クリップボードを復元します。このオプションがない場合、音声入力後クリップボードには文字起こしのテキストが含まれます。"
+          }
+        }
+      }
+    },
+    "Resume Dictation Hotkeys": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diktat-Hotkeys fortsetzen"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ディクテーションのホットキーを再開"
           }
         }
       }
@@ -11905,18 +12247,18 @@
         }
       }
     },
-    "The language being spoken. Setting this explicitly improves accuracy.": {
+    "Controls push-to-talk dictation, workflows that inherit the global spoken language, and CLI/API defaults when they use app defaults. Recorder and Recovery have separate language settings.": {
       "localizations": {
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die gesprochene Sprache. Explizites Festlegen verbessert die Genauigkeit."
+            "value": "Steuert Push-to-Talk-Diktat, Workflows, die die globale gesprochene Sprache übernehmen, und CLI/API-Standardwerte, wenn sie App-Standardwerte verwenden. Recorder und Wiederherstellung haben separate Spracheinstellungen."
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "話している言語です。明示的に設定すると精度が向上します。"
+            "value": "プッシュ・トゥ・トークのディクテーション、グローバルの話す言語を継承するワークフロー、およびアプリのデフォルトを使用する場合のCLI/APIデフォルトを制御します。レコーダーとリカバリーには別の言語設定があります。"
           }
         }
       }
@@ -21051,6 +21393,22 @@
         }
       }
     },
+    "Remove microphone": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mikrofon entfernen"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "マイクを削除"
+          }
+        }
+      }
+    },
     "Remove Downloaded Model": {
       "localizations": {
         "ja": {
@@ -21453,6 +21811,16 @@
         }
       }
     },
+    "Auto-learned": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Automatisch gelernt"
+          }
+        }
+      }
+    },
     "Correction learning undone": {
       "localizations": {
         "de": {
@@ -21489,6 +21857,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "„%@“ -> „%@“ gelernt"
+          }
+        }
+      }
+    },
+    "Saved %d corrections to Dictionary": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%d Korrekturen im Wörterbuch gespeichert"
+          }
+        }
+      }
+    },
+    "Saved to Dictionary: “%@” -> “%@”": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Im Wörterbuch gespeichert: „%@“ -> „%@“"
           }
         }
       }
@@ -21699,6 +22087,106 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ordner ausgewählt"
+          }
+        }
+      }
+    },
+    "Add Fallback": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "フォールバックを追加"
+          }
+        }
+      }
+    },
+    "Drag this row to reorder global LLM fallbacks.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この行をドラッグしてグローバルLLMフォールバックを並べ替えます。"
+          }
+        }
+      }
+    },
+    "Drag to reorder global LLM fallbacks": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "グローバルLLMフォールバックを並べ替えるにはドラッグ"
+          }
+        }
+      }
+    },
+    "Global LLM Fallbacks": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "グローバルLLMフォールバック"
+          }
+        }
+      }
+    },
+    "Inherited LLM workflows try these providers in order. A workflow override uses only its selected provider.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "継承されたLLMワークフローは、これらのプロバイダを順番に試します。ワークフローの上書きは、選択したプロバイダのみを使用します。"
+          }
+        }
+      }
+    },
+    "No global LLM fallbacks are configured yet.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "グローバルLLMフォールバックはまだ設定されていません。"
+          }
+        }
+      }
+    },
+    "Remove fallback": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "フォールバックを削除"
+          }
+        }
+      }
+    },
+    "This workflow currently inherits the global LLM fallback list from Workflow settings.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このワークフローは現在、ワークフロー設定のグローバルLLMフォールバックリストを継承しています。"
+          }
+        }
+      }
+    },
+    "This workflow uses only its selected provider and does not use global fallbacks.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このワークフローは選択したプロバイダのみを使用し、グローバルフォールバックは使用しません。"
+          }
+        }
+      }
+    },
+    "Use Global Fallback List": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "グローバルフォールバックリストを使用"
           }
         }
       }

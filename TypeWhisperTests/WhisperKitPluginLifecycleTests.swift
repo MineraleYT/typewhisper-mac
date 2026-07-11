@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import WhisperKit
 import TypeWhisperPluginSDK
 @testable import TypeWhisper
 
@@ -11,7 +12,7 @@ final class WhisperKitPluginLifecycleTests: XCTestCase {
         func unsubscribe(id: UUID) {}
     }
 
-    private final class MockHostServices: HostServices, @unchecked Sendable {
+    private final class MockHostServices: HostServices, HostModelLifecyclePolicyProviding, @unchecked Sendable {
         private var defaults: [String: Any]
         private var secrets: [String: String] = [:]
 
@@ -20,11 +21,17 @@ final class WhisperKitPluginLifecycleTests: XCTestCase {
         var activeAppBundleId: String?
         var activeAppName: String?
         var availableRuleNames: [String] = []
+        var shouldRestoreLoadedModelsPassively: Bool
         private(set) var capabilitiesChangedCount = 0
 
-        init(pluginDataDirectory: URL, defaults: [String: Any] = [:]) {
+        init(
+            pluginDataDirectory: URL,
+            defaults: [String: Any] = [:],
+            shouldRestoreLoadedModelsPassively: Bool = true
+        ) {
             self.pluginDataDirectory = pluginDataDirectory
             self.defaults = defaults
+            self.shouldRestoreLoadedModelsPassively = shouldRestoreLoadedModelsPassively
         }
 
         func storeSecret(key: String, value: String) throws { secrets[key] = value }
@@ -35,10 +42,37 @@ final class WhisperKitPluginLifecycleTests: XCTestCase {
         func setStreamingDisplayActive(_ active: Bool) {}
     }
 
-    private func makeHost(defaults: [String: Any] = [:]) throws -> MockHostServices {
+    private func makeHost(
+        defaults: [String: Any] = [:],
+        shouldRestoreLoadedModelsPassively: Bool = true
+    ) throws -> MockHostServices {
         let pluginDataDirectory = try TestSupport.makeTemporaryDirectory(prefix: "WhisperKitLifecycleTests")
-        return MockHostServices(pluginDataDirectory: pluginDataDirectory, defaults: defaults)
+        return MockHostServices(
+            pluginDataDirectory: pluginDataDirectory,
+            defaults: defaults,
+            shouldRestoreLoadedModelsPassively: shouldRestoreLoadedModelsPassively
+        )
     }
+
+    #if DEBUG
+    private func waitForRestoreLoadedModelInvocationCount(
+        _ plugin: WhisperKitPlugin,
+        toBecome expected: Int,
+        timeout: Duration = .seconds(1),
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if plugin.restoreLoadedModelInvocationCountForTesting == expected {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(plugin.restoreLoadedModelInvocationCountForTesting, expected, file: file, line: line)
+    }
+    #endif
 
     func testAvailableModelsIncludeDistilLargeV3Turbo() {
         let model = WhisperKitPlugin.availableModels.first {
@@ -48,6 +82,13 @@ final class WhisperKitPluginLifecycleTests: XCTestCase {
         XCTAssertEqual(model?.displayName, "Distil Large v3 Turbo")
         XCTAssertEqual(model?.sizeDescription, "~600 MB")
         XCTAssertEqual(model?.ramRequirement, "8 GB+")
+    }
+
+    func testExactChineseLanguageDisablesWhisperKitLanguageDetection() {
+        let options = WhisperKitPlugin.decodingOptions(language: "zh", translate: false)
+
+        XCTAssertEqual(options.language, "zh")
+        XCTAssertFalse(options.detectLanguage)
     }
 
     func testActivationPromotesPersistedLoadedModelToSelectedModelWhenSelectionMissing() async throws {
@@ -65,6 +106,103 @@ final class WhisperKitPluginLifecycleTests: XCTestCase {
         XCTAssertFalse(plugin.isConfigured)
         XCTAssertEqual(host.userDefault(forKey: "loadedModel") as? String, "openai_whisper-tiny")
         XCTAssertEqual(host.capabilitiesChangedCount, 0)
+    }
+
+    func testActivationSkipsPassiveRestoreWhenHostDisallowsIt() async throws {
+        let host = try makeHost(
+            defaults: ["loadedModel": "openai_whisper-tiny"],
+            shouldRestoreLoadedModelsPassively: false
+        )
+        defer { TestSupport.remove(host.pluginDataDirectory) }
+
+        let plugin = WhisperKitPlugin()
+        plugin.activate(host: host)
+
+        XCTAssertFalse(plugin.shouldRestoreLoadedModelsPassively)
+        XCTAssertEqual(plugin.selectedModelId, "openai_whisper-tiny")
+        XCTAssertEqual(host.userDefault(forKey: "selectedModel") as? String, "openai_whisper-tiny")
+
+        #if DEBUG
+        await waitForRestoreLoadedModelInvocationCount(plugin, toBecome: 0)
+        #endif
+
+        XCTAssertFalse(plugin.isConfigured)
+        XCTAssertEqual(host.userDefault(forKey: "loadedModel") as? String, "openai_whisper-tiny")
+        XCTAssertEqual(host.capabilitiesChangedCount, 0)
+    }
+
+    func testActivationSchedulesPassiveRestoreWhenHostAllowsIt() async throws {
+        let host = try makeHost(defaults: ["loadedModel": "openai_whisper-tiny"])
+        defer { TestSupport.remove(host.pluginDataDirectory) }
+
+        let plugin = WhisperKitPlugin()
+        plugin.activate(host: host)
+
+        XCTAssertTrue(plugin.shouldRestoreLoadedModelsPassively)
+        #if DEBUG
+        await waitForRestoreLoadedModelInvocationCount(plugin, toBecome: 1)
+        #endif
+    }
+
+    func testRestoreWhileSameModelLoadingDoesNotStartAnotherLoad() async throws {
+        let modelId = "openai_whisper-large-v3_turbo"
+        let host = try makeHost(
+            defaults: [
+                "selectedModel": modelId,
+                "loadedModel": modelId,
+            ],
+            shouldRestoreLoadedModelsPassively: false
+        )
+        defer { TestSupport.remove(host.pluginDataDirectory) }
+
+        let plugin = WhisperKitPlugin()
+        plugin.activate(host: host)
+        plugin.setLoadingModelForTesting(modelId)
+
+        let generation = plugin.modelLoadGenerationForTesting
+
+        await plugin.restoreLoadedModel(allowDownloads: true)
+
+        XCTAssertEqual(plugin.modelLoadGenerationForTesting, generation)
+        XCTAssertEqual(plugin.loadingModelIdForTesting, modelId)
+        XCTAssertEqual(plugin.currentSettingsActivity?.message, "Optimizing model")
+        #if DEBUG
+        XCTAssertEqual(plugin.restoreLoadedModelInvocationCountForTesting, 1)
+        #endif
+    }
+
+    func testRestoreFallsBackToSelectedDownloadedModelWhenLoadedMarkerMissing() throws {
+        let modelId = "openai_whisper-tiny"
+        let host = try makeHost(
+            defaults: ["selectedModel": modelId],
+            shouldRestoreLoadedModelsPassively: false
+        )
+        defer { TestSupport.remove(host.pluginDataDirectory) }
+        _ = try makeUsableWhisperModelDirectory(host: host, modelId: modelId)
+
+        let plugin = WhisperKitPlugin()
+        plugin.activate(host: host)
+
+        XCTAssertNil(host.userDefault(forKey: "loadedModel"))
+        XCTAssertEqual(plugin.selectedModelId, modelId)
+        XCTAssertEqual(plugin.restoreTargetModelIdForTesting(allowDownloads: false), modelId)
+    }
+
+    func testExplicitRestoreFallsBackToSelectedModelWhenLoadedMarkerMissing() throws {
+        let modelId = "openai_whisper-large-v3_turbo"
+        let host = try makeHost(
+            defaults: ["selectedModel": modelId],
+            shouldRestoreLoadedModelsPassively: false
+        )
+        defer { TestSupport.remove(host.pluginDataDirectory) }
+
+        let plugin = WhisperKitPlugin()
+        plugin.activate(host: host)
+
+        XCTAssertNil(host.userDefault(forKey: "loadedModel"))
+        XCTAssertEqual(plugin.selectedModelId, modelId)
+        XCTAssertNil(plugin.restoreTargetModelIdForTesting(allowDownloads: false))
+        XCTAssertEqual(plugin.restoreTargetModelIdForTesting(allowDownloads: true), modelId)
     }
 
     func testUnloadWithoutClearingPersistenceKeepsLoadedModelMarker() throws {
@@ -202,6 +340,7 @@ final class WhisperKitPluginLifecycleTests: XCTestCase {
         XCTAssertEqual(plugin.currentSettingsActivity?.isError, true)
         XCTAssertEqual(host.capabilitiesChangedCount, 1)
         XCTAssertTrue(plugin.currentSettingsActivity?.message.contains("Large v3 Turbo") == true)
+        XCTAssertNil(plugin.loadingModelIdForTesting)
     }
 
     func testActivationDoesNotMarkPluginConfiguredBeforeRestoreSucceeds() async throws {

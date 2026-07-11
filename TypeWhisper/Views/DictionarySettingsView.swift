@@ -59,10 +59,11 @@ struct DictionarySettingsView: View {
                 Text(String(localized: "All")).tag(DictionaryViewModel.FilterTab.all)
                 Text(String(localized: "Terms")).tag(DictionaryViewModel.FilterTab.terms)
                 Text(String(localized: "Corrections")).tag(DictionaryViewModel.FilterTab.corrections)
+                Text(String(localized: "Auto-learned")).tag(DictionaryViewModel.FilterTab.autoLearned)
                 Text(String(localized: "Term Packs")).tag(DictionaryViewModel.FilterTab.termPacks)
             }
             .pickerStyle(.segmented)
-            .frame(width: 340)
+            .frame(width: 470)
 
             Spacer()
 
@@ -109,7 +110,7 @@ struct DictionarySettingsView: View {
                     DictionaryEngineSupportSection(rows: engineSupportRows)
                 }
 
-                if viewModel.filteredEntries.isEmpty {
+                if viewModel.filteredEntryRows.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "line.3.horizontal.decrease.circle")
                             .font(.system(size: 32))
@@ -120,8 +121,13 @@ struct DictionarySettingsView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 48)
                 } else {
-                    ForEach(viewModel.filteredEntries) { entry in
-                        DictionaryCardView(entry: entry, viewModel: viewModel)
+                    ForEach(viewModel.filteredEntryRows) { row in
+                        DictionaryCardView(
+                            row: row,
+                            setEntryEnabled: { viewModel.setEntryEnabled(id: row.id, enabled: $0) },
+                            editEntry: { viewModel.startEditingEntry(id: row.id) },
+                            deleteEntry: { viewModel.deleteEntry(id: row.id) }
+                        )
                     }
                 }
             }
@@ -524,23 +530,24 @@ private struct TermPackCardView: View {
 // MARK: - Dictionary Card
 
 private struct DictionaryCardView: View {
-    let entry: DictionaryEntry
-    @ObservedObject var viewModel: DictionaryViewModel
-    @State private var isHovering = false
+    let row: DictionaryEntryRow
+    let setEntryEnabled: (Bool) -> Void
+    let editEntry: () -> Void
+    let deleteEntry: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
-            Text(entry.type.displayName)
+            Text(row.type.displayName)
                 .font(.caption)
                 .fontWeight(.medium)
-                .foregroundStyle(entry.type == .correction ? Color.orange : Color.accentColor)
+                .foregroundStyle(row.type == .correction ? Color.orange : Color.accentColor)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background((entry.type == .correction ? Color.orange : Color.accentColor).opacity(0.12))
+                .background((row.type == .correction ? Color.orange : Color.accentColor).opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 5))
 
-            if entry.type == .correction, let replacement = entry.replacement {
-                Text(entry.original)
+            if row.type == .correction, let replacement = row.replacementDisplayText {
+                Text(row.original)
                     .font(.callout)
                     .strikethrough()
                     .foregroundStyle(.secondary)
@@ -549,16 +556,21 @@ private struct DictionaryCardView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
-                Text(dictionaryReplacementDisplayText(replacement))
+                Text(replacement)
                     .font(.callout)
                     .fontWeight(.medium)
             } else {
-                Text(entry.original)
+                Text(row.original)
                     .font(.callout)
                     .fontWeight(.medium)
+
+                DictionaryBoostingBadge(
+                    label: row.termBoostingLabel,
+                    value: row.formattedCtcMinSimilarity
+                )
             }
 
-            if entry.caseSensitive {
+            if row.caseSensitive {
                 Text("Aa")
                     .font(.caption2)
                     .padding(.horizontal, 5)
@@ -568,15 +580,19 @@ private struct DictionaryCardView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 3))
             }
 
+            if row.source == .autoLearned {
+                DictionarySourceBadge()
+            }
+
             Spacer()
 
             Toggle("", isOn: Binding(
-                get: { entry.isEnabled },
-                set: { _ in viewModel.toggleEntry(entry) }
+                get: { row.isEnabled },
+                set: { setEntryEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()
-            .accessibilityLabel(String(localized: "Enable \(entry.original)"))
+            .accessibilityLabel(String(localized: "Enable \(row.original)"))
             .onTapGesture {}
         }
         .padding(.horizontal, 10)
@@ -587,25 +603,55 @@ private struct DictionaryCardView: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(isHovering ? Color.accentColor.opacity(0.3) : Color.primary.opacity(0.06), lineWidth: 1)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
         )
         .contentShape(Rectangle())
-        .onHover { hovering in
-            isHovering = hovering
-        }
         .onTapGesture {
-            viewModel.startEditing(entry)
+            editEntry()
         }
         .accessibilityElement(children: .combine)
         .contextMenu {
             Button(String(localized: "Edit")) {
-                viewModel.startEditing(entry)
+                editEntry()
             }
             Divider()
             Button(String(localized: "Delete"), role: .destructive) {
-                viewModel.deleteEntry(entry)
+                deleteEntry()
             }
         }
+    }
+}
+
+private struct DictionarySourceBadge: View {
+    var body: some View {
+        Label(String(localized: "Auto-learned"), systemImage: "wand.and.sparkles")
+            .font(.caption2)
+            .lineLimit(1)
+            .foregroundStyle(Color.yellow)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.yellow.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+}
+
+private struct DictionaryBoostingBadge: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "slider.horizontal.3")
+                .font(.caption2)
+            Text(value.isEmpty ? label : "\(label) \(value)")
+                .font(.caption2)
+                .lineLimit(1)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.secondary.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 }
 
@@ -672,6 +718,40 @@ private struct DictionaryEditorSheet: View {
                     }
                     .padding(.vertical, 8)
                 }
+
+                if viewModel.editType == .term {
+                    GroupBox(String(localized: "Boosting")) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Picker(String(localized: "Boosting"), selection: $viewModel.editTermBoostingMode) {
+                                ForEach(DictionaryViewModel.TermBoostingMode.allCases) { mode in
+                                    Text(mode.displayName).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+
+                            if viewModel.editTermBoostingMode == .advanced {
+                                HStack(spacing: 10) {
+                                    Text(String(localized: "Threshold"))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+
+                                    Slider(
+                                        value: $viewModel.editAdvancedCtcMinSimilarity,
+                                        in: DictionaryViewModel.minimumAdvancedCtcMinSimilarity...DictionaryViewModel.maximumAdvancedCtcMinSimilarity
+                                    )
+
+                                    Text(String(format: "%.2f", viewModel.editAdvancedCtcMinSimilarity))
+                                        .font(.caption)
+                                        .monospacedDigit()
+                                        .frame(width: 36, alignment: .trailing)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 8)
+                    }
+                }
             }
             .padding()
 
@@ -699,7 +779,7 @@ private struct DictionaryEditorSheet: View {
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
         }
-        .frame(width: 400, height: 340)
+        .frame(width: 430, height: viewModel.editType == .term ? 455 : 340)
         .onAppear {
             focusedField = .original
         }

@@ -1,5 +1,6 @@
 import AVFoundation
 import CryptoKit
+import Darwin
 import Foundation
 import os.log
 import TypeWhisperPluginSDK
@@ -215,6 +216,35 @@ enum PluginDiagnosticsSupport {
     }
 }
 
+private enum DiagnosticProcessMemorySupport {
+    static func snapshot() -> DiagnosticsReport.ProcessMemoryInfo {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPointer in
+                task_info(
+                    mach_task_self_,
+                    task_flavor_t(TASK_VM_INFO),
+                    reboundPointer,
+                    &count
+                )
+            }
+        }
+
+        guard result == KERN_SUCCESS else {
+            return DiagnosticsReport.ProcessMemoryInfo(
+                residentSizeBytes: nil,
+                physicalFootprintBytes: nil
+            )
+        }
+
+        return DiagnosticsReport.ProcessMemoryInfo(
+            residentSizeBytes: UInt64(info.resident_size),
+            physicalFootprintBytes: UInt64(info.phys_footprint)
+        )
+    }
+}
+
 private struct DiagnosticsReport: Encodable {
     struct AppInfo: Encodable {
         let version: String
@@ -256,6 +286,25 @@ private struct DiagnosticsReport: Encodable {
         let remoteAccessAllowed: Bool
     }
 
+    struct ProcessMemoryInfo: Encodable, Equatable {
+        let residentSizeBytes: UInt64?
+        let physicalFootprintBytes: UInt64?
+    }
+
+    struct PluginRuntimeMemoryInfo: Encodable, Equatable {
+        let runtimeIdentifier: String
+        let activeMemoryBytes: Int
+        let cacheMemoryBytes: Int
+        let peakMemoryBytes: Int
+
+        init(_ snapshot: PluginRuntimeMemorySnapshot) {
+            self.runtimeIdentifier = snapshot.runtimeIdentifier
+            self.activeMemoryBytes = snapshot.activeMemoryBytes
+            self.cacheMemoryBytes = snapshot.cacheMemoryBytes
+            self.peakMemoryBytes = snapshot.peakMemoryBytes
+        }
+    }
+
     struct AudioOutputInfo: Encodable {
         let deviceID: UInt32
         let uid: String?
@@ -292,6 +341,7 @@ private struct DiagnosticsReport: Encodable {
         let storedSelectedVersion: String?
         let source: DiagnosticPluginSourceInfo
         let currentSettingsActivity: DiagnosticPluginActivityInfo?
+        let runtimeMemory: PluginRuntimeMemoryInfo?
         let registryVersion: String?
         let registrySource: String?
         let externalBundleNotice: String?
@@ -362,8 +412,12 @@ private struct DiagnosticsReport: Encodable {
     let app: AppInfo
     let system: SystemInfo
     let permissions: PermissionsInfo
+    let secureInput: SecureInputDiagnostics
     let model: ModelInfo
     let api: APIInfo
+    let processMemory: ProcessMemoryInfo
+    let modelAutoUnload: ModelAutoUnloadDiagnosticsSnapshot
+    let memoryExtraction: MemoryExtractionDiagnosticsSnapshot
     let audio: AudioInfo
     let plugins: [PluginInfo]
     let skippedExternalBundles: [SkippedExternalBundleInfo]
@@ -422,7 +476,7 @@ final class ErrorLogService: ObservableObject {
         let defaults = UserDefaults.standard
         let pluginManager = PluginManager.shared ?? container.pluginManager
         let outputSnapshot = CoreAudioOutputVolumeController().defaultOutputSnapshot()
-        let modelAutoUnloadSeconds = defaults.integer(forKey: UserDefaultsKeys.modelAutoUnloadSeconds)
+        let modelAutoUnloadSeconds = ModelAutoUnloadPolicy.effectiveSeconds(defaults: defaults)
         let indicatorStyle = DictationViewModel.loadIndicatorStyle(defaults: defaults)
         let indicatorPreviewEnabled = DictationViewModel.loadIndicatorTranscriptPreviewEnabled(defaults: defaults)
         let indicatorPreviewOffset = DictationViewModel.loadIndicatorTranscriptPreviewFontSizeOffset(defaults: defaults)
@@ -437,6 +491,7 @@ final class ErrorLogService: ObservableObject {
                 nil
             }
             let activity = (loadedPlugin.instance as? any PluginSettingsActivityReporting)?.currentSettingsActivity
+            let runtimeMemory = (loadedPlugin.instance as? any PluginRuntimeMemoryDiagnosticsReporting)?.runtimeMemorySnapshot
             let registryEntry = container.pluginRegistryService.registry.first { $0.id == loadedPlugin.manifest.id }
             let externalNotice = pluginManager.externalBundleNotice(
                 for: loadedPlugin.manifest.id,
@@ -467,6 +522,7 @@ final class ErrorLogService: ObservableObject {
                 storedSelectedVersion: defaults.string(forKey: Self.pluginDefaultKey(pluginId: loadedPlugin.manifest.id, key: "selectedVersion")),
                 source: pluginSource,
                 currentSettingsActivity: activity.map(DiagnosticPluginActivityInfo.init),
+                runtimeMemory: runtimeMemory.map(DiagnosticsReport.PluginRuntimeMemoryInfo.init),
                 registryVersion: registryEntry?.version,
                 registrySource: registryEntry?.source.rawValue,
                 externalBundleNotice: externalNotice?.diagnosticsValue
@@ -499,7 +555,7 @@ final class ErrorLogService: ObservableObject {
         }
 
         return DiagnosticsReport(
-            schemaVersion: 6,
+            schemaVersion: 8,
             exportedAt: Date(),
             app: .init(
                 version: AppConstants.appVersion,
@@ -522,6 +578,7 @@ final class ErrorLogService: ObservableObject {
                 microphoneGranted: AVAudioApplication.shared.recordPermission == .granted,
                 accessibilityGranted: container.textInsertionService.isAccessibilityGranted
             ),
+            secureInput: SecureInputDiagnosticsProvider.snapshot(),
             model: .init(
                 selectedProviderId: container.modelManagerService.selectedProviderId,
                 selectedModelId: container.modelManagerService.selectedModelId,
@@ -538,6 +595,9 @@ final class ErrorLogService: ObservableObject {
                 loopbackOnly: true,
                 remoteAccessAllowed: false
             ),
+            processMemory: DiagnosticProcessMemorySupport.snapshot(),
+            modelAutoUnload: container.modelManagerService.autoUnloadDiagnosticsSnapshot(),
+            memoryExtraction: container.memoryService.extractionDiagnosticsSnapshot(),
             audio: .init(
                 selectedInputDeviceUID: defaults.string(forKey: UserDefaultsKeys.selectedInputDeviceUID),
                 selectedInputDeviceName: container.audioDeviceService.selectedDevice?.name,
@@ -557,7 +617,10 @@ final class ErrorLogService: ObservableObject {
             ),
             plugins: pluginDiagnostics,
             skippedExternalBundles: skippedExternalBundleDiagnostics,
-            workflows: Self.workflowDiagnosticsSnapshot(from: container.workflowService),
+            workflows: Self.workflowDiagnosticsSnapshot(
+                from: container.workflowService,
+                promptProcessingService: container.promptProcessingService
+            ),
             settings: .init(
                 bundledReleaseChannel: AppConstants.releaseChannel.rawValue,
                 selectedUpdateChannel: AppConstants.effectiveUpdateChannel.rawValue,
@@ -571,7 +634,7 @@ final class ErrorLogService: ObservableObject {
                 memoryCaptureScope: MemoryCaptureScope.load(from: defaults).rawValue,
                 appFormattingEnabled: defaults.bool(forKey: UserDefaultsKeys.appFormattingEnabled),
                 modelAutoUnloadSeconds: modelAutoUnloadSeconds,
-                modelAutoUnloadPolicy: Self.modelAutoUnloadPolicy(seconds: modelAutoUnloadSeconds),
+                modelAutoUnloadPolicy: ModelAutoUnloadPolicy.policyName(seconds: modelAutoUnloadSeconds),
                 indicatorStyle: indicatorStyle.rawValue,
                 indicatorSupportsTranscriptPreview: indicatorStyle.supportsTranscriptPreview,
                 indicatorTranscriptPreviewEnabled: indicatorPreviewEnabled,
@@ -606,18 +669,24 @@ final class ErrorLogService: ObservableObject {
         )
     }
 
-    static func workflowDiagnosticsSnapshot(from workflowService: WorkflowService) -> DiagnosticWorkflowSnapshot {
+    static func workflowDiagnosticsSnapshot(
+        from workflowService: WorkflowService,
+        promptProcessingService: PromptProcessingService
+    ) -> DiagnosticWorkflowSnapshot {
         let workflows = workflowService.workflows
         let enabledWorkflows = workflows.filter(\.isEnabled)
+        let primaryFallbackItem = promptProcessingService.primaryFallbackItem
         return DiagnosticWorkflowSnapshot(
             totalCount: workflows.count,
             enabledCount: enabledWorkflows.count,
-            defaultLLMProviderId: trimmedOrNil(workflowService.defaultProviderId),
-            defaultLLMCloudModel: trimmedOrNil(workflowService.defaultCloudModel),
+            defaultLLMProviderId: trimmedOrNil(primaryFallbackItem?.providerId),
+            defaultLLMCloudModel: trimmedOrNil(primaryFallbackItem?.modelId),
             enabledWorkflows: enabledWorkflows.map { workflow in
                 let behavior = workflow.behavior
                 let output = workflow.output
                 let trigger = workflow.trigger
+                let explicitProviderId = trimmedOrNil(behavior.providerId)
+                let inheritedFallbackItem = explicitProviderId == nil ? primaryFallbackItem : nil
 
                 return DiagnosticWorkflowInfo(
                     name: workflow.name,
@@ -630,8 +699,10 @@ final class ErrorLogService: ObservableObject {
                     outputFormat: trimmedOrNil(output.format),
                     outputAutoEnter: output.autoEnter,
                     targetActionPluginId: trimmedOrNil(output.targetActionPluginId),
-                    llmProviderId: workflowService.llmProviderId(for: workflow),
-                    llmCloudModel: workflowService.llmCloudModel(for: workflow),
+                    llmProviderId: explicitProviderId ?? trimmedOrNil(inheritedFallbackItem?.providerId),
+                    llmCloudModel: explicitProviderId == nil
+                        ? trimmedOrNil(inheritedFallbackItem?.modelId)
+                        : trimmedOrNil(behavior.cloudModel),
                     transcriptionEngineId: trimmedOrNil(behavior.transcriptionEngineId),
                     transcriptionModelId: trimmedOrNil(behavior.transcriptionModelId),
                     hasCustomInstruction: hasCustomWorkflowInstruction(behavior.settings),
@@ -655,17 +726,6 @@ final class ErrorLogService: ObservableObject {
     private static func trimmedOrNil(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed?.isEmpty == false ? trimmed : nil
-    }
-
-    private static func modelAutoUnloadPolicy(seconds: Int) -> String {
-        switch seconds {
-        case 0:
-            return "never"
-        case -1:
-            return "immediate"
-        default:
-            return "afterSeconds"
-        }
     }
 
     private func loadEntries() {

@@ -131,6 +131,10 @@ final class DictionaryServiceTests: XCTestCase {
         XCTAssertEqual(learned.count, 2)
         XCTAssertEqual(learned.map(\.original), ["langauge", "recieve"])
         XCTAssertEqual(service.correctionsCount, 3)
+        XCTAssertEqual(
+            service.corrections.filter { $0.source == .autoLearned }.map(\.original),
+            ["langauge", "recieve"]
+        )
 
         let protectedEntry = try XCTUnwrap(service.corrections.first { $0.original == "langauge" })
         service.updateEntry(
@@ -183,7 +187,60 @@ final class DictionaryServiceTests: XCTestCase {
         XCTAssertEqual(learned.count, 1)
         XCTAssertEqual(learned.first?.original, "filler")
         XCTAssertEqual(learned.first?.replacement, "")
-        XCTAssertEqual(service.applyCorrections(to: "drop filler text"), "drop  text")
+        XCTAssertEqual(service.applyCorrections(to: "drop filler text"), "drop text")
+    }
+
+    @MainActor
+    func testWhitespaceBearingLatinFillerCorrectionsStillApplyAtWordBoundaries() throws {
+        let plainDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(plainDirectory) }
+
+        let plainService = DictionaryService(appSupportDirectory: plainDirectory)
+        plainService.addEntry(type: .correction, original: "um", replacement: "")
+
+        XCTAssertEqual(plainService.applyCorrections(to: "Um I think this works"), "I think this works")
+        XCTAssertEqual(plainService.applyCorrections(to: "I said um today"), "I said today")
+
+        let whitespaceDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(whitespaceDirectory) }
+
+        let service = DictionaryService(appSupportDirectory: whitespaceDirectory)
+        service.addEntry(type: .correction, original: "um ", replacement: "")
+        service.addEntry(type: .correction, original: " huh", replacement: "")
+
+        XCTAssertEqual(service.applyCorrections(to: "Um I think this works"), "I think this works")
+        XCTAssertEqual(service.applyCorrections(to: "I said um today"), "I said today")
+        XCTAssertEqual(service.applyCorrections(to: "this was huh"), "this was")
+    }
+
+    @MainActor
+    func testWhitespaceBearingFillerCorrectionsKeepOneSeparatorBetweenWords() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        service.addEntry(type: .correction, original: " um ", replacement: "")
+
+        XCTAssertEqual(service.applyCorrections(to: "I said um today"), "I said today")
+        XCTAssertEqual(service.applyCorrections(to: "I said, um today"), "I said, today")
+    }
+
+    @MainActor
+    func testLatinCorrectionsMatchWholeWordsOnly() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        service.addEntry(type: .correction, original: "rake", replacement: "RAKE")
+        service.addEntry(type: .correction, original: "um", replacement: "")
+        service.addEntry(type: .correction, original: "um ", replacement: "")
+
+        XCTAssertEqual(service.applyCorrections(to: "rake"), "RAKE")
+        XCTAssertEqual(service.applyCorrections(to: "Rake"), "RAKE")
+        XCTAssertEqual(service.applyCorrections(to: "brake rakes"), "brake rakes")
+        XCTAssertEqual(service.applyCorrections(to: "Use rake, rake/brake, and (rake)."), "Use RAKE, RAKE/brake, and (RAKE).")
+        XCTAssertEqual(service.applyCorrections(to: "umbrella stand"), "umbrella stand")
+        XCTAssertEqual(service.applyCorrections(to: "album art"), "album art")
     }
 
     @MainActor
@@ -298,6 +355,7 @@ final class DictionaryServiceTests: XCTestCase {
         XCTAssertEqual(service.corrections.first?.original, "TEH")
         XCTAssertEqual(service.corrections.first?.replacement, "The")
         XCTAssertEqual(service.corrections.first?.caseSensitive, true)
+        XCTAssertEqual(service.corrections.first?.source, .manual)
         XCTAssertEqual(service.corrections.first?.usageCount, 1)
         XCTAssertTrue(try service.deleteAPICorrection(original: "teh"))
         XCTAssertEqual(service.correctionsCount, 0)
@@ -310,16 +368,58 @@ final class DictionaryServiceTests: XCTestCase {
         defer { TestSupport.remove(appSupportDirectory) }
 
         let service = DictionaryService(appSupportDirectory: appSupportDirectory)
-        service.addEntry(type: .term, original: " Kubernetes ")
+        service.addEntry(type: .term, original: " Kubernetes ", ctcMinSimilarity: 0.65)
         service.addEntry(type: .term, original: "MLX")
         service.addEntry(type: .term, original: "mlx")
         service.addEntry(type: .term, original: "TypeWhisper")
 
         XCTAssertEqual(service.enabledTerms(), ["Kubernetes", "MLX", "TypeWhisper"])
+        XCTAssertEqual(service.enabledTermHints(), [
+            PluginDictionaryTermHint(text: "Kubernetes", ctcMinSimilarity: 0.65),
+            PluginDictionaryTermHint(text: "MLX", ctcMinSimilarity: nil),
+            PluginDictionaryTermHint(text: "TypeWhisper", ctcMinSimilarity: nil),
+        ])
         XCTAssertEqual(
             service.getTermsForPrompt(providerId: nil),
             PluginDictionaryTerms.prompt(from: ["Kubernetes", "MLX", "TypeWhisper"])
         )
+    }
+
+    @MainActor
+    func testAPITermEntriesPersistThresholdsAndPlainTermsPreserveExistingValues() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        try service.setAPITermEntries(
+            [
+                (term: " TypeWhisper ", ctcMinSimilarity: 0.65),
+                (term: "Reson8", ctcMinSimilarity: nil),
+            ],
+            replaceExisting: true
+        )
+
+        XCTAssertEqual(service.enabledTermHints(), [
+            PluginDictionaryTermHint(text: "Reson8", ctcMinSimilarity: nil),
+            PluginDictionaryTermHint(text: "TypeWhisper", ctcMinSimilarity: 0.65),
+        ])
+
+        try service.setAPITerms(["typewhisper", "Caivex"], replaceExisting: false)
+
+        XCTAssertEqual(service.enabledTermHints(), [
+            PluginDictionaryTermHint(text: "Caivex", ctcMinSimilarity: nil),
+            PluginDictionaryTermHint(text: "Reson8", ctcMinSimilarity: nil),
+            PluginDictionaryTermHint(text: "typewhisper", ctcMinSimilarity: 0.65),
+        ])
+
+        try service.setAPITermEntries(
+            [(term: "TypeWhisper", ctcMinSimilarity: nil)],
+            replaceExisting: true
+        )
+
+        XCTAssertEqual(service.enabledTermHints(), [
+            PluginDictionaryTermHint(text: "TypeWhisper", ctcMinSimilarity: nil),
+        ])
     }
 
     @MainActor
@@ -336,6 +436,10 @@ final class DictionaryServiceTests: XCTestCase {
         installPlugins([plugin], appSupportDirectory: appSupportDirectory)
 
         XCTAssertEqual(service.getTermsForPrompt(providerId: plugin.providerId), "Alpha, Gamma")
+        XCTAssertEqual(service.getTermHints(providerId: plugin.providerId), [
+            PluginDictionaryTermHint(text: "Alpha", ctcMinSimilarity: nil),
+            PluginDictionaryTermHint(text: "Gamma", ctcMinSimilarity: nil),
+        ])
     }
 
     @MainActor
@@ -405,6 +509,94 @@ final class DictionaryServiceTests: XCTestCase {
         installPlugins([plugin], appSupportDirectory: appSupportDirectory)
 
         XCTAssertEqual(service.getTermsForPrompt(providerId: plugin.providerId), "Alpha, Beta Beta, Gamma")
+    }
+
+    @MainActor
+    func testDictionaryEntryRowsSnapshotLargeFilteredListsWithStableIDs() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        let terms = (1...120).map {
+            (
+                type: DictionaryEntryType.term,
+                original: String(format: "Term-%03d", $0),
+                replacement: nil as String?,
+                caseSensitive: true,
+                ctcMinSimilarity: nil as Float?
+            )
+        }
+        let corrections = (1...120).map {
+            (
+                type: DictionaryEntryType.correction,
+                original: String(format: "Wrong-%03d", $0),
+                replacement: String(format: "Correct-%03d", $0) as String?,
+                caseSensitive: false,
+                ctcMinSimilarity: nil as Float?
+            )
+        }
+        service.addEntries(terms + corrections + [
+            (
+                type: DictionaryEntryType.correction,
+                original: "empty-replacement",
+                replacement: "" as String?,
+                caseSensitive: true,
+                ctcMinSimilarity: nil as Float?
+            )
+        ])
+
+        let viewModel = DictionaryViewModel(dictionaryService: service)
+        viewModel.filterTab = .corrections
+        let correctionRows = viewModel.filteredEntryRows
+
+        XCTAssertEqual(correctionRows.count, 121)
+        XCTAssertTrue(correctionRows.allSatisfy { $0.type == .correction })
+        XCTAssertEqual(correctionRows.first { $0.original == "empty-replacement" }?.replacementDisplayText, "\"\"")
+
+        let correctionIDs = correctionRows.map(\.id)
+        viewModel.filterTab = .all
+        let allCorrectionIDs = viewModel.filteredEntryRows
+            .filter { $0.type == .correction }
+            .map(\.id)
+        XCTAssertEqual(allCorrectionIDs, correctionIDs)
+
+        service.learnCorrection(original: "autolearned", replacement: "auto learned")
+        let autoLearnedViewModel = DictionaryViewModel(dictionaryService: service)
+        autoLearnedViewModel.filterTab = .autoLearned
+        let autoLearnedRows = autoLearnedViewModel.filteredEntryRows
+        XCTAssertEqual(autoLearnedRows.map(\.original), ["autolearned"])
+        XCTAssertTrue(autoLearnedRows.allSatisfy { $0.source == .autoLearned })
+    }
+
+    @MainActor
+    func testDictionaryEntryIDActionsEditSetEnabledToggleAndDeleteMatchingEntry() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        service.addEntry(type: .correction, original: "teh", replacement: "the", caseSensitive: true)
+        let viewModel = DictionaryViewModel(dictionaryService: service)
+        let row = try XCTUnwrap(viewModel.filteredEntryRows.first)
+
+        viewModel.setEntryEnabled(id: row.id, enabled: false)
+        XCTAssertFalse(try XCTUnwrap(service.entries.first { $0.id == row.id }).isEnabled)
+        viewModel.setEntryEnabled(id: row.id, enabled: false)
+        XCTAssertFalse(try XCTUnwrap(service.entries.first { $0.id == row.id }).isEnabled)
+        viewModel.setEntryEnabled(id: row.id, enabled: true)
+        XCTAssertTrue(try XCTUnwrap(service.entries.first { $0.id == row.id }).isEnabled)
+        viewModel.toggleEntry(id: row.id)
+        XCTAssertFalse(try XCTUnwrap(service.entries.first { $0.id == row.id }).isEnabled)
+
+        viewModel.startEditingEntry(id: row.id)
+        XCTAssertTrue(viewModel.isEditing)
+        XCTAssertFalse(viewModel.isCreatingNew)
+        XCTAssertEqual(viewModel.editType, .correction)
+        XCTAssertEqual(viewModel.editOriginal, "teh")
+        XCTAssertEqual(viewModel.editReplacement, "the")
+        XCTAssertTrue(viewModel.editCaseSensitive)
+
+        viewModel.deleteEntry(id: row.id)
+        XCTAssertFalse(service.entries.contains { $0.id == row.id })
     }
 
     @MainActor

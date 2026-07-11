@@ -162,7 +162,12 @@ final class CartesiaPluginTests: XCTestCase {
 
     func testTranscriptionRequestUsesNativeCartesiaEndpointHeadersLanguageAndWordTimestamps() throws {
         let request = try CartesiaPlugin.makeTranscriptionRequest(
-            wavData: Data("wav".utf8),
+            uploadFile: PluginAudioUploadFile(
+                data: Data("m4a".utf8),
+                filename: "audio.m4a",
+                contentType: "audio/mp4",
+                format: "m4a"
+            ),
             apiKey: "sk_car_test",
             modelId: CartesiaPlugin.sttModelId,
             language: "de"
@@ -177,9 +182,9 @@ final class CartesiaPluginTests: XCTestCase {
         XCTAssertTrue(request.value(forHTTPHeaderField: "Content-Type")?.hasPrefix("multipart/form-data; boundary=") == true)
         XCTAssertEqual(request.timeoutInterval, 600)
 
-        let body = try XCTUnwrap(String(data: try XCTUnwrap(request.httpBody), encoding: .utf8))
-        XCTAssertTrue(body.contains(#"name="file"; filename="audio.wav""#))
-        XCTAssertTrue(body.contains("Content-Type: audio/wav"))
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
+        XCTAssertTrue(body.contains(#"name="file"; filename="audio.m4a""#))
+        XCTAssertTrue(body.contains("Content-Type: audio/mp4"))
         XCTAssertTrue(body.contains("name=\"model\"\r\n\r\nink-whisper"))
         XCTAssertTrue(body.contains("name=\"language\"\r\n\r\nde"))
         XCTAssertTrue(body.contains("name=\"timestamp_granularities[]\"\r\n\r\nword"))
@@ -300,7 +305,7 @@ final class CartesiaPluginTests: XCTestCase {
         XCTAssertEqual(request.url?.path, "/stt")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Cartesia-Version"), CartesiaPlugin.apiVersion)
 
-        let body = try XCTUnwrap(String(data: try XCTUnwrap(request.httpBody), encoding: .utf8))
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
         XCTAssertTrue(body.contains("name=\"language\"\r\n\r\nde"))
     }
 
@@ -329,8 +334,82 @@ final class CartesiaPluginTests: XCTestCase {
         XCTAssertEqual(result.text, "Hello, how are you?")
 
         let request = try XCTUnwrap(store.sessions.first?.requestedRequests.first)
-        let body = try XCTUnwrap(String(data: try XCTUnwrap(request.httpBody), encoding: .utf8))
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
         XCTAssertTrue(body.contains("name=\"language\"\r\n\r\nen"))
+    }
+
+    func testTranscribeFallsBackToWavWhenM4AEncodingFails() async throws {
+        let host = try PluginTestHostServices(secrets: ["api-key": "sk_car_live"])
+        let plugin = CartesiaPlugin()
+        plugin.activate(host: host)
+
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(
+                    Data(#"{"type":"transcript","text":"Hello from wav","language":"en","words":[]}"#.utf8),
+                    Self.httpResponse(url: "https://api.cartesia.ai/stt", statusCode: 200)
+                )
+            ])
+        }
+
+        let result = try await plugin.transcribe(
+            audio: AudioData(samples: [], wavData: Data("fallback-wav".utf8), duration: 1),
+            language: nil,
+            translate: false,
+            prompt: nil
+        )
+
+        XCTAssertEqual(result.text, "Hello from wav")
+        let request = try XCTUnwrap(store.sessions.first?.requestedRequests.first)
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
+        XCTAssertTrue(body.contains(#"name="file"; filename="audio.wav""#))
+        XCTAssertTrue(body.contains("Content-Type: audio/wav"))
+        XCTAssertTrue(body.contains("fallback-wav"))
+    }
+
+    func testTranscribeRetriesWithWavWhenM4AUploadRejected() async throws {
+        let host = try PluginTestHostServices(secrets: ["api-key": "sk_car_live"])
+        let plugin = CartesiaPlugin()
+        plugin.activate(host: host)
+
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(
+                    Data(#"{"error":{"message":"unsupported audio format"}}"#.utf8),
+                    Self.httpResponse(url: "https://api.cartesia.ai/stt", statusCode: 400)
+                ),
+                .success(
+                    Data(#"{"type":"transcript","text":"Hello from wav","language":"de","words":[]}"#.utf8),
+                    Self.httpResponse(url: "https://api.cartesia.ai/stt", statusCode: 200)
+                ),
+            ])
+        }
+
+        let samples = [Float](repeating: 0.1, count: 16_000)
+        let audio = AudioData(samples: samples, wavData: PluginWavEncoder.encode(samples), duration: 1.0)
+        let result = try await plugin.transcribe(
+            audio: audio,
+            language: "de-DE",
+            translate: false,
+            prompt: nil
+        )
+
+        XCTAssertEqual(result.text, "Hello from wav")
+        let requests = try XCTUnwrap(store.sessions.first?.requestedRequests)
+        XCTAssertEqual(requests.count, 2)
+
+        let firstBody = String(decoding: try XCTUnwrap(requests[0].httpBody), as: UTF8.self)
+        XCTAssertTrue(firstBody.contains(#"name="file"; filename="audio.m4a""#))
+        XCTAssertTrue(firstBody.contains("Content-Type: audio/mp4"))
+
+        let retryBody = String(decoding: try XCTUnwrap(requests[1].httpBody), as: UTF8.self)
+        XCTAssertTrue(retryBody.contains(#"name="file"; filename="audio.wav""#))
+        XCTAssertTrue(retryBody.contains("Content-Type: audio/wav"))
+        XCTAssertTrue(retryBody.contains("name=\"model\"\r\n\r\nink-whisper"))
+        XCTAssertTrue(retryBody.contains("name=\"language\"\r\n\r\nde"))
+        XCTAssertEqual(requests[1].timeoutInterval, 600)
     }
 
     func testTranscribeUsesConfiguredEnglishLanguageWhenSelected() async throws {
@@ -359,7 +438,7 @@ final class CartesiaPluginTests: XCTestCase {
         )
 
         let request = try XCTUnwrap(store.sessions.first?.requestedRequests.first)
-        let body = try XCTUnwrap(String(data: try XCTUnwrap(request.httpBody), encoding: .utf8))
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
         XCTAssertTrue(body.contains("name=\"language\"\r\n\r\nen"))
     }
 
@@ -388,7 +467,7 @@ final class CartesiaPluginTests: XCTestCase {
         XCTAssertEqual(result.text, "Привет, как дела?")
 
         let request = try XCTUnwrap(store.sessions.first?.requestedRequests.first)
-        let body = try XCTUnwrap(String(data: try XCTUnwrap(request.httpBody), encoding: .utf8))
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
         XCTAssertTrue(body.contains("name=\"language\"\r\n\r\nru"))
     }
 
@@ -422,7 +501,7 @@ final class CartesiaPluginTests: XCTestCase {
         XCTAssertEqual(result.detectedLanguage, "ru")
 
         let request = try XCTUnwrap(store.sessions.first?.requestedRequests.first)
-        let body = try XCTUnwrap(String(data: try XCTUnwrap(request.httpBody), encoding: .utf8))
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
         XCTAssertTrue(body.contains("name=\"language\"\r\n\r\nru"))
     }
 
@@ -449,7 +528,7 @@ final class CartesiaPluginTests: XCTestCase {
         )
 
         let request = try XCTUnwrap(store.sessions.first?.requestedRequests.first)
-        let body = try XCTUnwrap(String(data: try XCTUnwrap(request.httpBody), encoding: .utf8))
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
         XCTAssertTrue(body.contains("name=\"language\"\r\n\r\nen"))
     }
 

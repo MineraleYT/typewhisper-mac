@@ -215,6 +215,91 @@ final class OpenAICompatiblePluginTests: XCTestCase {
         XCTAssertEqual(result.text, "hello")
         XCTAssertEqual(store.sessions[0].requestedPaths, ["/v1/audio/transcriptions"])
         XCTAssertEqual(store.sessions[0].requestedRequests.first?.timeoutInterval, 600)
+        let body = String(decoding: try XCTUnwrap(store.sessions[0].requestedRequests.first?.httpBody), as: UTF8.self)
+        XCTAssertTrue(body.contains(#"filename="audio.m4a""#))
+        XCTAssertTrue(body.contains("Content-Type: audio/mp4"))
+    }
+
+    func testTranscribeRetriesWithWavWhenCompatibleServerRejectsM4A() async throws {
+        let host = try PluginTestHostServices(
+            defaults: [
+                "baseURL": "https://example.test",
+                "selectedModel": "large-v3",
+            ]
+        )
+        let plugin = OpenAICompatiblePlugin()
+        plugin.activate(host: host)
+
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(
+                    Data(#"{"error":"unsupported audio format"}"#.utf8),
+                    Self.httpResponse(url: "https://example.test/v1/audio/transcriptions", statusCode: 415)
+                ),
+                .success(
+                    Data(#"{"text":"fallback hello"}"#.utf8),
+                    Self.httpResponse(url: "https://example.test/v1/audio/transcriptions", statusCode: 200)
+                ),
+            ])
+        }
+
+        let samples = [Float](repeating: 0.1, count: 16_000)
+        let audio = AudioData(samples: samples, wavData: PluginWavEncoder.encode(samples), duration: 1.0)
+        let result = try await plugin.transcribe(audio: audio, language: "de", translate: false, prompt: "TypeWhisper")
+
+        XCTAssertEqual(result.text, "fallback hello")
+        let requests = store.sessions[0].requestedRequests
+        XCTAssertEqual(requests.count, 2)
+        let firstBody = String(decoding: try XCTUnwrap(requests[0].httpBody), as: UTF8.self)
+        XCTAssertTrue(firstBody.contains(#"filename="audio.m4a""#))
+        let retryBody = String(decoding: try XCTUnwrap(requests[1].httpBody), as: UTF8.self)
+        XCTAssertTrue(retryBody.contains(#"filename="audio.wav""#))
+        XCTAssertTrue(retryBody.contains("name=\"model\"\r\n\r\nlarge-v3"))
+        XCTAssertTrue(retryBody.contains("name=\"language\"\r\n\r\nde"))
+        XCTAssertTrue(retryBody.contains("name=\"prompt\"\r\n\r\nTypeWhisper"))
+    }
+
+    func testTranscribeRetriesWithWavWhenCompatibleServerReportsFfprobeFailure() async throws {
+        let host = try PluginTestHostServices(
+            defaults: [
+                "baseURL": "https://example.test",
+                "selectedModel": "large-v3",
+            ]
+        )
+        let plugin = OpenAICompatiblePlugin()
+        plugin.activate(host: host)
+
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(
+                    Data(#"{"error":"ffprobe failed: moov atom not found"}"#.utf8),
+                    Self.httpResponse(url: "https://example.test/v1/audio/transcriptions", statusCode: 500)
+                ),
+                .success(
+                    Data(#"{"text":"fallback hello"}"#.utf8),
+                    Self.httpResponse(url: "https://example.test/v1/audio/transcriptions", statusCode: 200)
+                ),
+            ])
+        }
+
+        let samples = [Float](repeating: 0.1, count: 16_000)
+        let audio = AudioData(samples: samples, wavData: PluginWavEncoder.encode(samples), duration: 1.0)
+        let result = try await plugin.transcribe(audio: audio, language: "de", translate: false, prompt: "TypeWhisper")
+
+        XCTAssertEqual(result.text, "fallback hello")
+        let requests = store.sessions[0].requestedRequests
+        XCTAssertEqual(requests.count, 2)
+        let firstBody = String(decoding: try XCTUnwrap(requests[0].httpBody), as: UTF8.self)
+        XCTAssertTrue(firstBody.contains(#"filename="audio.m4a""#))
+        XCTAssertTrue(firstBody.contains("Content-Type: audio/mp4"))
+        let retryBody = String(decoding: try XCTUnwrap(requests[1].httpBody), as: UTF8.self)
+        XCTAssertTrue(retryBody.contains(#"filename="audio.wav""#))
+        XCTAssertTrue(retryBody.contains("Content-Type: audio/wav"))
+        XCTAssertTrue(retryBody.contains("name=\"model\"\r\n\r\nlarge-v3"))
+        XCTAssertTrue(retryBody.contains("name=\"language\"\r\n\r\nde"))
+        XCTAssertTrue(retryBody.contains("name=\"prompt\"\r\n\r\nTypeWhisper"))
     }
 
     func testProfileSpecificTranscriptionUsesSeparateCredentialsAndURLs() async throws {
@@ -327,9 +412,90 @@ final class OpenAICompatiblePluginTests: XCTestCase {
         let inceptionJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: inceptionBody) as? [String: Any])
         XCTAssertEqual(inceptionJSON["model"] as? String, "inception-chat")
         XCTAssertEqual(inceptionJSON["max_tokens"] as? Int, 4096)
+        XCTAssertNil(inceptionJSON["max_completion_tokens"])
         XCTAssertEqual(inceptionJSON["temperature"] as? Double, 0.9)
         let inceptionThinking = try XCTUnwrap(inceptionJSON["thinking"] as? [String: String])
         XCTAssertEqual(inceptionThinking["type"], "enabled")
+    }
+
+    func testProcessRetriesWithMaxCompletionTokensWhenProviderRequestsIt() async throws {
+        let host = try PluginTestHostServices(
+            defaults: [
+                "baseURL": "https://example.test",
+                "selectedLLMModel": "future-chat",
+            ],
+            secrets: ["api-key": "secret-token"]
+        )
+        let plugin = OpenAICompatiblePlugin()
+        plugin.activate(host: host)
+        plugin.setLLMTemperatureMode(.custom)
+        plugin.setLLMTemperatureValue(0.4)
+        plugin.setThinkingEnabled(true)
+
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(
+                    Data(
+                        #"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}"#.utf8
+                    ),
+                    Self.httpResponse(url: "https://example.test/v1/chat/completions", statusCode: 400)
+                ),
+                .success(
+                    Data(#"{"choices":[{"message":{"content":"processed"}}]}"#.utf8),
+                    Self.httpResponse(url: "https://example.test/v1/chat/completions", statusCode: 200)
+                ),
+            ])
+        }
+
+        let result = try await plugin.process(
+            systemPrompt: "Fix",
+            userText: "hello",
+            model: nil,
+            temperatureDirective: .inheritProviderSetting
+        )
+
+        XCTAssertEqual(result, "processed")
+        let requests = store.sessions[0].requestedRequests
+        XCTAssertEqual(requests.count, 2)
+
+        let firstBody = try XCTUnwrap(requests[0].httpBody)
+        let firstJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: firstBody) as? [String: Any])
+        XCTAssertEqual(firstJSON["model"] as? String, "future-chat")
+        XCTAssertEqual(firstJSON["max_tokens"] as? Int, 4096)
+        XCTAssertNil(firstJSON["max_completion_tokens"])
+
+        let retryBody = try XCTUnwrap(requests[1].httpBody)
+        let retryJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: retryBody) as? [String: Any])
+        XCTAssertEqual(retryJSON["model"] as? String, "future-chat")
+        XCTAssertEqual(retryJSON["max_completion_tokens"] as? Int, 4096)
+        XCTAssertNil(retryJSON["max_tokens"])
+        XCTAssertEqual(retryJSON["temperature"] as? Double, 0.4)
+        let retryThinking = try XCTUnwrap(retryJSON["thinking"] as? [String: String])
+        XCTAssertEqual(retryThinking["type"], "enabled")
+    }
+
+    func testFallbackOutputTokenParameterRequiresBothParameterNames() {
+        XCTAssertEqual(
+            OpenAICompatiblePlugin.fallbackOutputTokenParameter(
+                after: .maxTokens,
+                errorMessage: "Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens' instead."
+            ),
+            .maxCompletionTokens
+        )
+        XCTAssertEqual(
+            OpenAICompatiblePlugin.fallbackOutputTokenParameter(
+                after: .maxCompletionTokens,
+                errorMessage: "Unsupported parameter: 'max_completion_tokens'. Use 'max_tokens' instead."
+            ),
+            .maxTokens
+        )
+        XCTAssertNil(
+            OpenAICompatiblePlugin.fallbackOutputTokenParameter(
+                after: .maxTokens,
+                errorMessage: "model not found"
+            )
+        )
     }
 
     func testProcessSurfacesOpenAICompatibleErrorMessage() async throws {

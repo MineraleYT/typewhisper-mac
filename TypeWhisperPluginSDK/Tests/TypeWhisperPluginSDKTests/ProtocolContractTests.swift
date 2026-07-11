@@ -79,6 +79,22 @@ private struct MockHostServices: HostServices {
     func setStreamingDisplayActive(_ active: Bool) {}
 }
 
+private struct PolicyAwareMockHostServices: HostServices, HostModelLifecyclePolicyProviding {
+    let pluginDataDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let activeAppBundleId: String? = nil
+    let activeAppName: String? = nil
+    let eventBus: EventBusProtocol = MockEventBus()
+    let availableRuleNames: [String] = []
+    let shouldRestoreLoadedModelsPassively: Bool
+
+    func storeSecret(key: String, value: String) throws {}
+    func loadSecret(key: String) -> String? { nil }
+    func userDefault(forKey key: String) -> Any? { nil }
+    func setUserDefault(_ value: Any?, forKey key: String) {}
+    func notifyCapabilitiesChanged() {}
+    func setStreamingDisplayActive(_ active: Bool) {}
+}
+
 @objc(MockTranscriptionPlugin)
 private final class MockTranscriptionPlugin: NSObject, TranscriptionEnginePlugin, @unchecked Sendable {
     static let pluginId = "com.typewhisper.mock.transcription"
@@ -330,6 +346,54 @@ private final class MockTTSPlaybackSession: TTSPlaybackSession, @unchecked Senda
     }
 }
 
+private actor GateConcurrencyState {
+    private var currentCount = 0
+    private(set) var maxConcurrent = 0
+
+    func enter() {
+        currentCount += 1
+        maxConcurrent = max(maxConcurrent, currentCount)
+    }
+
+    func leave() {
+        currentCount -= 1
+    }
+}
+
+private actor GateLockRelease {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isReleased = false
+
+    func wait() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            if isReleased {
+                continuation.resume()
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func release() {
+        isReleased = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor GateOperationState {
+    private(set) var didRun = false
+
+    func markRan() {
+        didRun = true
+    }
+
+    func value() -> Bool {
+        didRun
+    }
+}
+
 @objc(MockTTSPlugin)
 private final class MockTTSPlugin: NSObject, TTSProviderPlugin, @unchecked Sendable {
     static let pluginId = "com.typewhisper.mock.tts"
@@ -366,6 +430,67 @@ private final class MockTTSPlugin: NSObject, TTSProviderPlugin, @unchecked Senda
 }
 
 final class ProtocolContractTests: XCTestCase {
+    func testLocalInferenceGateSerializesConcurrentOperations() async throws {
+        let gate = PluginLocalInferenceGate()
+        let state = GateConcurrencyState()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    try await gate.withLock {
+                        await state.enter()
+                        try await Task.sleep(for: .milliseconds(20))
+                        await state.leave()
+                    }
+                }
+            }
+
+            try await group.waitForAll()
+        }
+
+        let maxConcurrent = await state.maxConcurrent
+        XCTAssertEqual(maxConcurrent, 1)
+    }
+
+    func testLocalInferenceGateDoesNotRunCancelledWaiter() async throws {
+        let gate = PluginLocalInferenceGate()
+        let release = GateLockRelease()
+        let cancelledOperation = GateOperationState()
+        let holderStarted = expectation(description: "holder acquired inference gate")
+
+        let holder = Task {
+            try await gate.withLock {
+                holderStarted.fulfill()
+                await release.wait()
+            }
+        }
+        await fulfillment(of: [holderStarted], timeout: 1.0)
+
+        let waiter = Task {
+            try await gate.withLock {
+                await cancelledOperation.markRan()
+            }
+        }
+        waiter.cancel()
+
+        try await Task.sleep(for: .milliseconds(20))
+        await release.release()
+        try await holder.value
+
+        do {
+            try await waiter.value
+            XCTFail("Cancelled waiter should throw before running gated operation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let cancelledOperationRan = await cancelledOperation.value()
+        XCTAssertFalse(cancelledOperationRan)
+
+        let followerRan = try await gate.withLock { true }
+        XCTAssertTrue(followerRan)
+    }
+
     func testPluginAuthRolesExposeStableRawValues() {
         XCTAssertEqual(PluginAuthRole.transcription.rawValue, "transcription")
         XCTAssertEqual(PluginAuthRole.llm.rawValue, "llm")
@@ -405,6 +530,14 @@ final class ProtocolContractTests: XCTestCase {
         XCTAssertEqual(host.availableRuleNames, ["Work", "Docs"])
         XCTAssertEqual(host.availableProfileNames, ["Work", "Docs"])
         XCTAssertEqual(host.activeAppName, "Notes")
+    }
+
+    func testHostServicesPassiveRestorePolicyDefaultsForLegacyHosts() {
+        let legacyHost = MockHostServices(eventBus: MockEventBus(), availableRuleNames: [])
+        XCTAssertTrue(legacyHost.shouldRestoreLoadedModelsPassively)
+
+        let policyAwareHost = PolicyAwareMockHostServices(shouldRestoreLoadedModelsPassively: false)
+        XCTAssertFalse(policyAwareHost.shouldRestoreLoadedModelsPassively)
     }
 
     func testHostServicesExposeWorkflowSnapshots() throws {
@@ -691,6 +824,29 @@ final class ProtocolContractTests: XCTestCase {
         XCTAssertEqual(
             PluginDictionaryTerms.prompt(from: ["TypeWhisper", "MLX"], maxLength: 100),
             "TypeWhisper, MLX"
+        )
+    }
+
+    func testPluginDictionaryTermHintsNormalizeAndPreserveThresholds() {
+        let hints = PluginDictionaryTerms.normalizedTermHints(from: [
+            PluginDictionaryTermHint(text: " Kubernetes ", ctcMinSimilarity: 0.65),
+            PluginDictionaryTermHint(text: "kubernetes", ctcMinSimilarity: 0.8),
+            PluginDictionaryTermHint(text: "MLX", ctcMinSimilarity: nil),
+            PluginDictionaryTermHint(text: "Clipped Low", ctcMinSimilarity: -0.25),
+            PluginDictionaryTermHint(text: "Clipped High", ctcMinSimilarity: 1.25),
+            PluginDictionaryTermHint(text: "Invalid", ctcMinSimilarity: .nan),
+        ])
+
+        XCTAssertEqual(hints, [
+            PluginDictionaryTermHint(text: "Kubernetes", ctcMinSimilarity: 0.65),
+            PluginDictionaryTermHint(text: "MLX", ctcMinSimilarity: nil),
+            PluginDictionaryTermHint(text: "Clipped Low", ctcMinSimilarity: 0),
+            PluginDictionaryTermHint(text: "Clipped High", ctcMinSimilarity: 1),
+            PluginDictionaryTermHint(text: "Invalid", ctcMinSimilarity: nil),
+        ])
+        XCTAssertEqual(
+            PluginDictionaryTerms.clippedTermHints(from: hints, budget: DictionaryTermsBudget(maxTotalChars: 12)),
+            [PluginDictionaryTermHint(text: "Kubernetes", ctcMinSimilarity: 0.65)]
         )
     }
 

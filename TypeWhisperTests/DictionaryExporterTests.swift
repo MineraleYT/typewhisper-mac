@@ -17,7 +17,7 @@ final class DictionaryExporterTests: XCTestCase {
         let service = DictionaryService(appSupportDirectory: appDir)
 
         service.addEntry(type: .correction, original: "teh", replacement: "the", caseSensitive: true)
-        service.addEntry(type: .term, original: "Kubernetes")
+        service.addEntry(type: .term, original: "Kubernetes", ctcMinSimilarity: 0.65)
 
         let json = DictionaryExporter.exportJSON(service.entries)
         let array = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]])
@@ -33,6 +33,7 @@ final class DictionaryExporterTests: XCTestCase {
         XCTAssertEqual(term["original"] as? String, "Kubernetes")
         XCTAssertNil(term["replacement"])
         XCTAssertEqual(term["caseSensitive"] as? Bool, false)
+        XCTAssertEqual(try XCTUnwrap(term["ctcMinSimilarity"] as? Double), 0.65, accuracy: 0.0001)
     }
 
     @MainActor
@@ -65,6 +66,7 @@ final class DictionaryExporterTests: XCTestCase {
         XCTAssertEqual(items[0].type, .term)
         XCTAssertEqual(items[0].original, "Kubernetes")
         XCTAssertTrue(items[0].caseSensitive)
+        XCTAssertNil(items[0].ctcMinSimilarity)
         XCTAssertEqual(items[1].type, .correction)
         XCTAssertEqual(items[1].replacement, "the")
     }
@@ -79,6 +81,26 @@ final class DictionaryExporterTests: XCTestCase {
         XCTAssertFalse(items[0].caseSensitive)
         XCTAssertTrue(items[0].isEnabled)
         XCTAssertNil(items[0].replacement)
+        XCTAssertNil(items[0].ctcMinSimilarity)
+    }
+
+    @MainActor
+    func testParseAndRoundTripTermCtcMinSimilarity() throws {
+        let json = """
+        [{"type": "term", "original": "Caivex", "ctcMinSimilarity": 0.65}]
+        """
+
+        let items = try DictionaryExporter.parseJSON(Data(json.utf8))
+
+        XCTAssertEqual(try XCTUnwrap(items.first?.ctcMinSimilarity), 0.65, accuracy: 0.0001)
+
+        let appDir = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appDir) }
+        let service = DictionaryService(appSupportDirectory: appDir)
+        let result = DictionaryExporter.importEntries(items, into: service)
+
+        XCTAssertEqual(result.imported, 1)
+        XCTAssertEqual(try XCTUnwrap(service.entries.first?.ctcMinSimilarity), 0.65, accuracy: 0.0001)
     }
 
     @MainActor
@@ -153,6 +175,41 @@ final class DictionaryExporterTests: XCTestCase {
         XCTAssertEqual(correction.type, .correction)
         XCTAssertEqual(correction.original, "¿")
         XCTAssertEqual(correction.replacement, "")
+    }
+
+    @MainActor
+    func testRoundTripPreservesAutoLearnedSource() throws {
+        let appDir = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appDir) }
+        let service = DictionaryService(appSupportDirectory: appDir)
+        service.learnCorrection(original: "recieve", replacement: "receive")
+
+        let json = DictionaryExporter.exportJSON(service.entries)
+        let array = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]])
+        XCTAssertEqual(array.first?["source"] as? String, DictionaryEntrySource.autoLearned.rawValue)
+
+        let parsed = try DictionaryExporter.parseJSON(Data(json.utf8))
+        let correction = try XCTUnwrap(parsed.first)
+        XCTAssertEqual(correction.source, .autoLearned)
+
+        let importedDir = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(importedDir) }
+        let importedService = DictionaryService(appSupportDirectory: importedDir)
+        let result = DictionaryExporter.importEntries(parsed, into: importedService)
+
+        XCTAssertEqual(result.imported, 1)
+        XCTAssertEqual(importedService.entries.first?.source, .autoLearned)
+    }
+
+    @MainActor
+    func testParseDefaultsUnknownSourceToManual() throws {
+        let json = """
+        [{"type": "correction", "original": "teh", "replacement": "the", "source": "future"}]
+        """
+
+        let items = try DictionaryExporter.parseJSON(Data(json.utf8))
+
+        XCTAssertEqual(items.first?.source, .manual)
     }
 
     @MainActor

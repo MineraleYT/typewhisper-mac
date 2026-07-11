@@ -20,6 +20,16 @@ enum DictionaryEntryType: String, Codable, CaseIterable {
     }
 }
 
+enum DictionaryEntrySource: String, Codable, CaseIterable, Sendable {
+    case manual
+    case autoLearned
+
+    static func source(for rawValue: String?) -> DictionaryEntrySource {
+        guard let rawValue else { return .manual }
+        return DictionaryEntrySource(rawValue: rawValue) ?? .manual
+    }
+}
+
 @Model
 final class DictionaryEntry {
     var id: UUID
@@ -28,13 +38,20 @@ final class DictionaryEntry {
     var replacement: String?
     var caseSensitive: Bool
     var isEnabled: Bool
+    var ctcMinSimilarity: Float?
     var createdAt: Date
     var updatedAt: Date?
     var usageCount: Int
+    var sourceRawValue: String?
 
     var type: DictionaryEntryType {
         get { DictionaryEntryType(rawValue: entryType) ?? .term }
         set { entryType = newValue.rawValue }
+    }
+
+    var source: DictionaryEntrySource {
+        get { DictionaryEntrySource.source(for: sourceRawValue) }
+        set { sourceRawValue = newValue.rawValue }
     }
 
     init(
@@ -44,6 +61,8 @@ final class DictionaryEntry {
         replacement: String? = nil,
         caseSensitive: Bool = false,
         isEnabled: Bool = true,
+        ctcMinSimilarity: Float? = nil,
+        source: DictionaryEntrySource = .manual,
         createdAt: Date = Date(),
         updatedAt: Date? = nil,
         usageCount: Int = 0
@@ -54,9 +73,11 @@ final class DictionaryEntry {
         self.replacement = replacement
         self.caseSensitive = caseSensitive
         self.isEnabled = isEnabled
+        self.ctcMinSimilarity = type == .term ? ctcMinSimilarity : nil
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.usageCount = usageCount
+        self.sourceRawValue = source.rawValue
     }
 
     var effectiveUpdatedAt: Date {
