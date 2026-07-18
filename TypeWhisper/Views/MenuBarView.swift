@@ -10,6 +10,7 @@ private final class MenuBarState: ObservableObject {
     @Published var isModelReady: Bool
     @Published var hasRecentTranscriptions: Bool
     @Published var canCopyLastTranscription: Bool
+    @Published var hasLastTranscribedText: Bool
     @Published var hasRecoverableRecording: Bool
     @Published var recorderState: AudioRecorderViewModel.RecorderState
     @Published var canToggleRecorder: Bool
@@ -34,6 +35,7 @@ private final class MenuBarState: ObservableObject {
         let hasRecentTranscriptions = recentTranscriptionStore.latestEntry(historyRecords: historyService.records) != nil
         self.hasRecentTranscriptions = hasRecentTranscriptions
         self.canCopyLastTranscription = hasRecentTranscriptions
+        self.hasLastTranscribedText = dictation.lastTranscribedText != nil
         self.hasRecoverableRecording = audioRecordingService.latestRecoveryRecordingURL != nil
         self.recorderState = recorder.state
         self.canToggleRecorder = recorder.canToggleRecording
@@ -86,6 +88,15 @@ private final class MenuBarState: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] url in
                 self?.hasRecoverableRecording = url != nil
+            }
+            .store(in: &cancellables)
+
+        dictation.$lastTranscribedText
+            .map { $0 != nil }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] hasText in
+                self?.hasLastTranscribedText = hasText
             }
             .store(in: &cancellables)
 
@@ -206,6 +217,7 @@ enum MenuBarMenuItem: Hashable {
     case toggleDictationHotkeysPause
     case transcribeFile
     case recoverLastRecording
+    case lastTranscription
     case recentTranscriptions
     case copyLastTranscription
     case readBackLastTranscription
@@ -214,9 +226,7 @@ enum MenuBarMenuItem: Hashable {
 
 enum MenuBarMenuSection: String, CaseIterable, Hashable {
     case general = "General"
-    case recorder = "Recorder"
     case transcription = "Transcription"
-    case updates = "Updates"
 
     var titleLocalizationKey: String {
         rawValue
@@ -226,12 +236,8 @@ enum MenuBarMenuSection: String, CaseIterable, Hashable {
         switch self {
         case .general:
             "General"
-        case .recorder:
-            "settings.tab.recorder"
         case .transcription:
             "Transcription"
-        case .updates:
-            "Updates"
         }
     }
 
@@ -243,14 +249,10 @@ enum MenuBarMenuSection: String, CaseIterable, Hashable {
         switch self {
         case .general:
             [.settings, .history, .errorLog]
-        case .recorder:
-            [.toggleRecorder]
         case .transcription:
             hasRecoverableRecording
-                ? [.toggleDictationHotkeysPause, .transcribeFile, .recoverLastRecording, .recentTranscriptions, .copyLastTranscription, .readBackLastTranscription]
-                : [.toggleDictationHotkeysPause, .transcribeFile, .recentTranscriptions, .copyLastTranscription, .readBackLastTranscription]
-        case .updates:
-            [.checkForUpdates]
+                ? [.toggleDictationHotkeysPause, .transcribeFile, .recoverLastRecording, .lastTranscription]
+                : [.toggleDictationHotkeysPause, .transcribeFile, .lastTranscription]
         }
     }
 }
@@ -267,6 +269,12 @@ struct MenuBarView: View {
 
             Divider()
 
+            // Primary action, promoted above the grouped sections so it is
+            // always the first actionable item under the status line.
+            menuItem(for: .toggleRecorder)
+
+            Divider()
+
             ForEach(MenuBarMenuSection.allCases, id: \.self) { section in
                 Section(String(localized: section.titleResource)) {
                     ForEach(section.items(hasRecoverableRecording: status.hasRecoverableRecording), id: \.self) { item in
@@ -276,6 +284,8 @@ struct MenuBarView: View {
             }
 
             Divider()
+
+            menuItem(for: .checkForUpdates)
 
             Button(String(localized: "Quit")) {
                 NSApplication.shared.terminate(nil)
@@ -351,32 +361,31 @@ struct MenuBarView: View {
                 Label(String(localized: "Recover Last Recording"), systemImage: "waveform")
             }
 
-        case .recentTranscriptions:
-            Button {
-                DictationViewModel.shared.triggerRecentTranscriptionsPalette()
+        case .lastTranscription:
+            Menu {
+                recentTranscriptionsButton
+                copyLastTranscriptionButton
+                readBackLastTranscriptionButton
             } label: {
-                Label(String(localized: "Recent Transcriptions"), systemImage: "clock.arrow.circlepath")
+                Label(
+                    localizedAppText("Last Transcription", de: "Letzte Transkription"),
+                    systemImage: "clock.arrow.circlepath"
+                )
             }
-            .keyboardShortcut(keyboardShortcut(from: status.recentTranscriptionsMenuShortcut))
-            .disabled(!status.hasRecentTranscriptions)
+            .disabled(
+                !status.hasRecentTranscriptions
+                    && !status.canCopyLastTranscription
+                    && !status.hasLastTranscribedText
+            )
+
+        case .recentTranscriptions:
+            recentTranscriptionsButton
 
         case .copyLastTranscription:
-            Button {
-                DictationViewModel.shared.copyLastTranscriptionToClipboard()
-            } label: {
-                Label(String(localized: "Copy Last Transcription"), systemImage: "doc.on.doc")
-            }
-            .keyboardShortcut(keyboardShortcut(from: status.copyLastTranscriptionMenuShortcut))
-            .disabled(!status.canCopyLastTranscription)
+            copyLastTranscriptionButton
 
         case .readBackLastTranscription:
-            Button {
-                DictationViewModel.shared.readBackLastTranscription()
-            } label: {
-                Label(String(localized: "Read Back Last Transcription"), systemImage: "speaker.wave.2")
-            }
-            .keyboardShortcut("r", modifiers: [.command, .shift])
-            .disabled(DictationViewModel.shared.lastTranscribedText == nil)
+            readBackLastTranscriptionButton
 
         case .checkForUpdates:
             Button(String(localized: "Check for Updates...")) {
@@ -384,6 +393,41 @@ struct MenuBarView: View {
             }
             .disabled(UpdateChecker.shared?.canCheckForUpdates() != true)
         }
+    }
+
+    // These are factored out so the "Last Transcription" submenu can reuse them
+    // without menuItem(for:) recursively referencing its own opaque return type.
+    @ViewBuilder
+    private var recentTranscriptionsButton: some View {
+        Button {
+            DictationViewModel.shared.triggerRecentTranscriptionsPalette()
+        } label: {
+            Label(String(localized: "Recent Transcriptions"), systemImage: "clock.arrow.circlepath")
+        }
+        .keyboardShortcut(keyboardShortcut(from: status.recentTranscriptionsMenuShortcut))
+        .disabled(!status.hasRecentTranscriptions)
+    }
+
+    @ViewBuilder
+    private var copyLastTranscriptionButton: some View {
+        Button {
+            DictationViewModel.shared.copyLastTranscriptionToClipboard()
+        } label: {
+            Label(String(localized: "Copy Last Transcription"), systemImage: "doc.on.doc")
+        }
+        .keyboardShortcut(keyboardShortcut(from: status.copyLastTranscriptionMenuShortcut))
+        .disabled(!status.canCopyLastTranscription)
+    }
+
+    @ViewBuilder
+    private var readBackLastTranscriptionButton: some View {
+        Button {
+            DictationViewModel.shared.readBackLastTranscription()
+        } label: {
+            Label(String(localized: "Read Back Last Transcription"), systemImage: "speaker.wave.2")
+        }
+        .keyboardShortcut("r", modifiers: [.command, .shift])
+        .disabled(!status.hasLastTranscribedText)
     }
 
     private var recorderToggleTitle: String {
