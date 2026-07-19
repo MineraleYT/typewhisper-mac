@@ -1,4 +1,5 @@
 import AppKit
+import AuthenticationServices
 import Combine
 import CryptoKit
 import Foundation
@@ -106,12 +107,120 @@ struct CrossDevicePremiumEntitlementVerifier: Sendable {
 
 private enum PremiumAccountServiceError: LocalizedError {
     case invalidEntitlementSignature
+    case appleSignInCancelled
+    case invalidAppleAuthorizationCallback
+    case appleAuthorizationFailed
+    case secureRandomGenerationFailed
 
     var errorDescription: String? {
         switch self {
         case .invalidEntitlementSignature:
             String(localized: "The Premium entitlement signature could not be verified.")
+        case .appleSignInCancelled:
+            nil
+        case .invalidAppleAuthorizationCallback:
+            String(localized: "The Sign in with Apple response could not be verified.")
+        case .appleAuthorizationFailed:
+            String(localized: "Sign in with Apple could not be completed.")
+        case .secureRandomGenerationFailed:
+            String(localized: "Secure sign-in data could not be generated.")
         }
+    }
+}
+
+private func decodeISO8601DateWithOptionalFractionalSeconds(
+    from decoder: Decoder
+) throws -> Date {
+    let container = try decoder.singleValueContainer()
+    let value = try container.decode(String.self)
+    let formatter = ISO8601DateFormatter()
+
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: value) {
+        return date
+    }
+
+    formatter.formatOptions = [.withInternetDateTime]
+    if let date = formatter.date(from: value) {
+        return date
+    }
+
+    throw DecodingError.dataCorruptedError(
+        in: container,
+        debugDescription: "Expected an ISO 8601 date"
+    )
+}
+
+@MainActor
+protocol AppleWebAuthenticating: AnyObject {
+    func authenticate(at authorizationURL: URL, callbackScheme: String) async throws -> URL
+}
+
+private final class AppleWebAuthenticationCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<URL, Error>?
+
+    init(continuation: CheckedContinuation<URL, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(callbackURL: URL?, error: Error?) {
+        lock.lock()
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+
+        guard let continuation else { return }
+        if let callbackURL {
+            continuation.resume(returning: callbackURL)
+        } else {
+            continuation.resume(throwing: error ?? URLError(.cancelled))
+        }
+    }
+}
+
+private func makeAppleWebAuthenticationSession(
+    authorizationURL: URL,
+    callbackScheme: String,
+    completion: AppleWebAuthenticationCompletion
+) -> ASWebAuthenticationSession {
+    ASWebAuthenticationSession(
+        url: authorizationURL,
+        callbackURLScheme: callbackScheme
+    ) { callbackURL, error in
+        completion.resume(callbackURL: callbackURL, error: error)
+    }
+}
+
+@MainActor
+final class AppleWebAuthenticationSession: NSObject, AppleWebAuthenticating, ASWebAuthenticationPresentationContextProviding {
+    private var authenticationSession: ASWebAuthenticationSession?
+    private let fallbackWindow = NSWindow()
+
+    func authenticate(at authorizationURL: URL, callbackScheme: String) async throws -> URL {
+        defer { authenticationSession = nil }
+        return try await withCheckedThrowingContinuation { continuation in
+            let completion = AppleWebAuthenticationCompletion(continuation: continuation)
+            let session = makeAppleWebAuthenticationSession(
+                authorizationURL: authorizationURL,
+                callbackScheme: callbackScheme,
+                completion: completion
+            )
+            session.presentationContextProvider = self
+            session.prefersEphemeralWebBrowserSession = false
+            authenticationSession = session
+            guard session.start() else {
+                completion.resume(
+                    callbackURL: nil,
+                    error: URLError(.cannotLoadFromNetwork)
+                )
+                return
+            }
+        }
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first ?? fallbackWindow
     }
 }
 
@@ -123,6 +232,11 @@ final class PremiumAccountService: ObservableObject {
     }
     private struct EntitlementResponse: Decodable { let entitlement: CrossDevicePremiumEntitlement? }
     private struct ErrorResponse: Decodable { let error: String }
+    private struct AppleWebStartResponse: Decodable {
+        let authorizationURL: URL
+        let state: String
+        let expiresAt: Date
+    }
 
     private enum Keys {
         static let cachedEntitlement = "premium.account.cachedEntitlement"
@@ -139,10 +253,11 @@ final class PremiumAccountService: ObservableObject {
     private let baseURL: URL
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
-    private let session: URLSession
+    private let requestExecutor: @Sendable (URLRequest) async throws -> (Data, URLResponse)
     private let keychainService: String
     private let deviceID: String
     private let entitlementVerifier: CrossDevicePremiumEntitlementVerifier?
+    private let appleWebAuthenticator: any AppleWebAuthenticating
 
     private static let productionEntitlementPublicKeyBase64 =
         "8ZwFh+yrpkZZ1VsZgjpZcOz2h3jKpGG93MTdRaCPqXFn/Loqh8u36hB9FLho+ozwuHbaNeoN1MxM2/AJKyBNvQ=="
@@ -153,6 +268,8 @@ final class PremiumAccountService: ObservableObject {
         defaults: UserDefaults = .standard,
         baseURL: URL? = nil,
         session: URLSession = .shared,
+        requestExecutor: (@Sendable (URLRequest) async throws -> (Data, URLResponse))? = nil,
+        appleWebAuthenticator: (any AppleWebAuthenticating)? = nil,
         keychainService: String = "com.typewhisper.mac.premium-account",
         entitlementPublicKeyBase64: String = PremiumAccountService.productionEntitlementPublicKeyBase64,
         isSignedInOverride: Bool? = nil,
@@ -163,13 +280,16 @@ final class PremiumAccountService: ObservableObject {
             ?? (Bundle.main.object(forInfoDictionaryKey: "TypeWhisperAccountBaseURL") as? String)
                 .flatMap(URL.init(string:))
             ?? URL(string: "https://app.typewhisper.com")!
-        self.session = session
+        self.requestExecutor = requestExecutor ?? { try await session.data(for: $0) }
+        self.appleWebAuthenticator = appleWebAuthenticator ?? AppleWebAuthenticationSession()
         self.keychainService = keychainService
         entitlementVerifier = CrossDevicePremiumEntitlementVerifier(
             publicKeyBase64: entitlementPublicKeyBase64
         )
         decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom(
+            decodeISO8601DateWithOptionalFractionalSeconds
+        )
         encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         if let existing = defaults.string(forKey: Keys.deviceID) {
@@ -191,32 +311,69 @@ final class PremiumAccountService: ObservableObject {
         if isSignedIn, automaticallyRefresh { Task { await refreshIfNeeded() } }
     }
 
-    func signIn(identityToken: String, authorizationCode: String?, nonceHash: String, polarLicenseKey: String?) async {
+    func signInWithApple(polarLicenseKey: String?) async {
         await perform {
-            let values = [
-                "identityToken": identityToken,
-                "authorizationCode": authorizationCode,
-                "nonceHash": nonceHash,
-            ].compactMapValues { $0 }
-            let session: AccountSession = try await request(
-                path: "/v1/auth/apple",
+            let nonce = try Self.randomBase64URLToken()
+            let codeVerifier = try Self.randomBase64URLToken()
+            let nonceHash = Self.sha256Hex(nonce)
+            let codeChallenge = Self.sha256Base64URL(codeVerifier)
+            let start: AppleWebStartResponse = try await request(
+                path: "/v1/auth/apple/web/start",
                 method: "POST",
-                body: try encoder.encode(values),
+                body: try encoder.encode([
+                    "nonceHash": nonceHash,
+                    "codeChallenge": codeChallenge,
+                ]),
                 authenticated: false
             )
-            try Self.saveToken(session.accessToken, service: keychainService)
-            isSignedIn = true
-            try acceptEntitlement(session.entitlement)
-            if let polarLicenseKey, !polarLicenseKey.isEmpty {
-                let response: EntitlementResponse = try await request(
-                    path: "/v1/entitlements/polar/link",
-                    method: "POST",
-                    body: try encoder.encode(["licenseKey": polarLicenseKey])
-                )
-                try acceptEntitlement(response.entitlement)
-            } else {
-                try await refresh()
+            guard start.expiresAt > Date(),
+                  start.authorizationURL.scheme == "https",
+                  start.authorizationURL.host == "appleid.apple.com" else {
+                throw PremiumAccountServiceError.invalidAppleAuthorizationCallback
             }
+
+            let callbackURL: URL
+            do {
+                callbackURL = try await appleWebAuthenticator.authenticate(
+                    at: start.authorizationURL,
+                    callbackScheme: "typewhisper"
+                )
+            } catch let error as ASWebAuthenticationSessionError where error.code == .canceledLogin {
+                throw PremiumAccountServiceError.appleSignInCancelled
+            } catch let error as URLError where error.code == .cancelled {
+                throw PremiumAccountServiceError.appleSignInCancelled
+            }
+
+            let callback = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)
+            let values = (callback?.queryItems ?? []).reduce(into: [String: String]()) { result, item in
+                if result[item.name] == nil, let value = item.value {
+                    result[item.name] = value
+                }
+            }
+            guard callbackURL.scheme == "typewhisper",
+                  callbackURL.host == "premium-auth",
+                  callbackURL.path == "/callback",
+                  values["state"] == start.state else {
+                throw PremiumAccountServiceError.invalidAppleAuthorizationCallback
+            }
+            if values["error"] == "user_cancelled_authorize" {
+                throw PremiumAccountServiceError.appleSignInCancelled
+            }
+            guard values["error"] == nil, let code = values["code"], !code.isEmpty else {
+                throw PremiumAccountServiceError.appleAuthorizationFailed
+            }
+
+            let accountSession: AccountSession = try await request(
+                path: "/v1/auth/apple/web/exchange",
+                method: "POST",
+                body: try encoder.encode([
+                    "state": start.state,
+                    "code": code,
+                    "codeVerifier": codeVerifier,
+                ]),
+                authenticated: false
+            )
+            try await acceptAccountSession(accountSession, polarLicenseKey: polarLicenseKey)
         }
     }
 
@@ -245,6 +402,25 @@ final class PremiumAccountService: ObservableObject {
         defaults.set(Date(), forKey: Keys.lastRefresh)
     }
 
+    private func acceptAccountSession(
+        _ accountSession: AccountSession,
+        polarLicenseKey: String?
+    ) async throws {
+        try Self.saveToken(accountSession.accessToken, service: keychainService)
+        isSignedIn = true
+        try acceptEntitlement(accountSession.entitlement)
+        if let polarLicenseKey, !polarLicenseKey.isEmpty {
+            let response: EntitlementResponse = try await request(
+                path: "/v1/entitlements/polar/link",
+                method: "POST",
+                body: try encoder.encode(["licenseKey": polarLicenseKey])
+            )
+            try acceptEntitlement(response.entitlement)
+        } else {
+            try await refresh()
+        }
+    }
+
     private func acceptEntitlement(_ value: CrossDevicePremiumEntitlement?) throws {
         guard let value else {
             entitlement = nil
@@ -268,6 +444,7 @@ final class PremiumAccountService: ObservableObject {
         errorMessage = nil
         defer { isWorking = false }
         do { try await operation() }
+        catch PremiumAccountServiceError.appleSignInCancelled {}
         catch { errorMessage = error.localizedDescription }
     }
 
@@ -292,7 +469,7 @@ final class PremiumAccountService: ObservableObject {
             }
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await requestExecutor(request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard (200..<300).contains(http.statusCode) else {
             if authenticated, http.statusCode == 401 || http.statusCode == 403 {
@@ -350,6 +527,31 @@ final class PremiumAccountService: ObservableObject {
             kSecAttrService as String: service,
             kSecAttrAccount as String: "access-token",
         ] as CFDictionary)
+    }
+
+    private static func randomBase64URLToken(byteCount: Int = 32) throws -> String {
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            throw PremiumAccountServiceError.secureRandomGenerationFailed
+        }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func sha256Hex(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func sha256Base64URL(_ value: String) -> String {
+        Data(SHA256.hash(data: Data(value.utf8)))
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }
 
