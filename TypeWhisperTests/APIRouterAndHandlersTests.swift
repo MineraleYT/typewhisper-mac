@@ -20,6 +20,23 @@ private func rtfAttributedStringContainsFontTrait(
     return NSFontManager.shared.traits(of: font).contains(trait)
 }
 
+private final class APIFakeAudioInputDeviceDefaultController: AudioInputDeviceDefaultControlling {
+    private var deviceID: AudioDeviceID?
+
+    init(defaultInputDeviceID: AudioDeviceID?) {
+        deviceID = defaultInputDeviceID
+    }
+
+    func defaultInputDeviceID() -> AudioDeviceID? {
+        deviceID
+    }
+
+    func setDefaultInputDeviceID(_ deviceID: AudioDeviceID) -> Bool {
+        self.deviceID = deviceID
+        return true
+    }
+}
+
 final class SecureInputDiagnosticsProviderTests: XCTestCase {
     func testSnapshotPrefersOnConsoleIORegistryOwner() {
         let consoleUsers: NSArray = [
@@ -4950,16 +4967,25 @@ final class APIRouterAndHandlersTests: XCTestCase {
             Self.restoreUserDefault(originalPriorityList, forKey: UserDefaultsKeys.inputDevicePriorityList)
         }
 
-        dictationContext = Self.makeDictationContext(appSupportDirectory: appSupportDirectory)
+        let defaultInputDeviceID = AudioDeviceID(79)
+        dictationContext = Self.makeDictationContext(
+            appSupportDirectory: appSupportDirectory,
+            audioDeviceTransportResolver: FakeAudioDeviceTransportResolver(
+                transports: [defaultInputDeviceID: kAudioDeviceTransportTypeBluetooth]
+            ),
+            audioDeviceDefaultInputController: APIFakeAudioInputDeviceDefaultController(
+                defaultInputDeviceID: defaultInputDeviceID
+            )
+        )
         let context = try XCTUnwrap(dictationContext)
         context.audioDeviceService.inputDevices = []
         context.audioRecordingService.hasMicrophonePermissionOverride = true
         context.audioRecordingService.inputAvailabilityOverride = { selectedDeviceID in
-            XCTAssertNil(selectedDeviceID)
+            XCTAssertEqual(selectedDeviceID, defaultInputDeviceID)
             return true
         }
         context.audioRecordingService.startRecordingOverride = {
-            XCTAssertNil(context.audioRecordingService.selectedDeviceID)
+            XCTAssertEqual(context.audioRecordingService.selectedDeviceID, defaultInputDeviceID)
             XCTAssertFalse(context.audioRecordingService.hasExplicitDeviceSelection)
         }
 
@@ -5985,6 +6011,7 @@ final class APIRouterAndHandlersTests: XCTestCase {
         audioDeviceTransportResolver: AudioDeviceTransportResolving = CoreAudioDeviceTransportResolver(),
         audioDeviceBluetoothInputRouteStabilizer: BluetoothInputRouteStabilizing = CoreAudioBluetoothInputRouteStabilizer(),
         audioDeviceSelectionEngineValidator: AudioInputSelectionEngineValidating = AVAudioInputSelectionEngineValidator(),
+        audioDeviceDefaultInputController: AudioInputDeviceDefaultControlling = CoreAudioInputDeviceDefaultController(),
         audioRecordingBluetoothInputRouteStabilizer: BluetoothInputRouteStabilizing = CoreAudioBluetoothInputRouteStabilizer()
     ) -> DictationContext {
         EventBus.shared = EventBus()
@@ -6041,7 +6068,8 @@ final class APIRouterAndHandlersTests: XCTestCase {
         let audioDeviceService = AudioDeviceService(
             transportResolver: audioDeviceTransportResolver,
             bluetoothInputRouteStabilizer: audioDeviceBluetoothInputRouteStabilizer,
-            selectionEngineValidator: audioDeviceSelectionEngineValidator
+            selectionEngineValidator: audioDeviceSelectionEngineValidator,
+            defaultInputDeviceController: audioDeviceDefaultInputController
         )
         let promptActionService = PromptActionService(appSupportDirectory: appSupportDirectory)
         let promptProcessingService = PromptProcessingService()
