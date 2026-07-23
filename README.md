@@ -8,7 +8,7 @@ Speech-to-text and AI text processing for macOS. Transcribe audio using on-devic
 
 TypeWhisper `1.5` is the current stable release for macOS. It includes system-wide dictation, file transcription, unified workflows, history, dictionary, snippets, bundled integrations, the community plugin registry, local automation APIs, app-aware insertion, expanded provider support, and local-model reliability improvements. The `main` branch is now preparing the `1.6` release-candidate line; `1.5` receives hotfixes only from `release/1.5`.
 
-See the [release readiness guide](docs/release-readiness.md), [support matrix](docs/support-matrix.md), and [release checklist](docs/release-checklist.md) for the active `1.6` release definition and ship gates.
+See the [release readiness guide](docs/release-readiness.md), [support matrix](docs/support-matrix.md), and [release validation process](docs/release-checklist.md) for the active `1.6` release definition and ship gates. Manual ship checks are tracked per candidate with the [release checklist issue template](.github/ISSUE_TEMPLATE/release-checklist.md).
 
 <p align="center">
   <video src="https://github.com/user-attachments/assets/22fe922d-4a4c-47d1-805e-684a148ebd03" autoplay loop muted playsinline width="270"></video>

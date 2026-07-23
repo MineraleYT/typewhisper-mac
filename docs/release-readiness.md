@@ -82,35 +82,14 @@ These surfaces remain part of `1.x`, but they are positioned as advanced or auto
 - `1.6.0-rc*` and daily builds are distributed as GitHub prereleases, appear in the shared Sparkle appcast only on their own channels, and do not update Homebrew.
 - The appcast entry for preview builds advertises `minimumSystemVersion` `14.0`.
 
-## Manual Smoke Checks Before Tagging
+## Manual Release Validation
 
-- Fresh install on a clean machine
-- Permission flow: microphone, accessibility, recovery after revoked access
-- First successful dictation
-- File transcription
-- Workflow prompt action from the app
-- Workflow setup flow across tabs
-- History edit/export
-- History entry shows both STT and AI-processed text where applicable
-- Workflow matching for app + URL, URL-only, app-only, direct hotkey, and global fallback triggers
-- Global LLM fallback ordering, legacy migration, unavailable-provider repair, failure advance, cancellation, and strict explicit workflow-provider behavior
-- Auto-submit workflow behavior and legacy Auto Enter profile compatibility
-- Plugin enable/disable
-- Community term pack download and apply
-- Sound feedback settings and sound switching
-- Spoken feedback (TTS) enable/disable, voice and speed selection, scope limited to transcription readback
-- Per-request engine/model selection through the HTTP API and CLI
-- Multilingual language hints: picker, search, ordered multi-select, selected count, first-hint fallback verification
-- Fn hotkey in press-and-release and press-and-hold strategies
-- CLI against a running local server, including `--engine` and `--model`
-- HTTP API `status`, `models`, `transcribe`
-- Notch, Overlay, and Minimal indicator styles
-- Transcript preview toggle
-- MLX plugin settings for HuggingFace token storage and removal
-- Dictionary terms streamed through AssemblyAI, Soniox, and SpeechAnalyzer without session breakage
-- Very short speech clips and streaming-preview/no-speech guard behavior
-- Audio preview and recording after device changes, especially AirPods/Bluetooth profile switches; no crash during Bluetooth route changes
-- Upgrade from `1.5.0` with History, Workflows, Dictionary, Snippets, hotkeys, enabled plugins, and update channel preserved
+Manual, user-visible acceptance checks are tracked for each candidate in a
+GitHub issue created from the
+[release checklist template](../.github/ISSUE_TEMPLATE/release-checklist.md).
+The issue records the tested tag or commit, real-hardware results, linked
+failures, and final sign-off. Build, test, signing, packaging, and appcast
+assertions remain automated by the release workflow and preflight scripts.
 
 ## Release Outputs
 
