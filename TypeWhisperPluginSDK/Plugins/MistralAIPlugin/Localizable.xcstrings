@@ -11,12 +11,42 @@
         }
       }
     },
+    "Applies to workflow (LLM) processing only.": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gilt nur für die Workflow-Verarbeitung (LLM)."
+          }
+        }
+      }
+    },
     "Cloud API integration for Mistral LLMs and Voxtral STT.": {
       "localizations": {
         "de": {
           "stringUnit": {
             "state": "translated",
             "value": "Cloud-API-Integration für Mistral-LLMs und Voxtral-STT."
+          }
+        }
+      }
+    },
+    "Custom": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Benutzerdefiniert"
+          }
+        }
+      }
+    },
+    "Default": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Standard"
           }
         }
       }
@@ -51,6 +81,16 @@
         }
       }
     },
+    "Provider Default": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Anbieter-Standard"
+          }
+        }
+      }
+    },
     "Remove": {
       "localizations": {
         "de": {
@@ -71,12 +111,22 @@
         }
       }
     },
-    "Select a Model": {
+    "Temperature": {
       "localizations": {
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Modell auswählen"
+            "value": "Temperatur"
+          }
+        }
+      }
+    },
+    "Temperature Mode": {
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Temperaturmodus"
           }
         }
       }
